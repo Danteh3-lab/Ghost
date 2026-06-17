@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+*.exe
+*.obj
+*.o
+*.dll
+*.log
+.env.local
+.claude/
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.user
