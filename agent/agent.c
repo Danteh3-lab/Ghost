@@ -71,6 +71,22 @@
 /* update download buffer — max binary size we accept */
 #define UPDATE_MAX_SIZE     (4 * 1024 * 1024)   /* 4 MB */
 
+/* ---------- defines missing from some MinGW headers ---------- */
+
+#ifndef NI_MAXHOST
+#define NI_MAXHOST 1025
+#endif
+
+/* ---------- forward declarations ---------- */
+
+static void c2_update(const char *url, const char *expected_sha256);
+static void c2_config_poll(void);
+static void persistence_paths(char *original_exe, int orig_size,
+                               char *persist_dir, int dir_size,
+                               char *persist_exe, int exe_size,
+                               char *persist_config, int cfg_size);
+static void persistence_uninstall(void);
+
 /* ============================================================================
  * SECTION 2: DATA STRUCTURES
  * ============================================================================ */
