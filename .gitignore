@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 *.exe
+!payloads/agent.exe
 *.obj
 *.o
 *.dll
