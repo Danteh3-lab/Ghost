@@ -31,7 +31,7 @@ export default function App() {
   const { data: apiEntries, error: ksErr } = usePolling(
     keystrokeFetcher,
     2_000,
-    activeView === "feed"
+    activeView === "feed" || activeView === "detail"
   );
 
   const activityFetcher = useCallback(
@@ -49,10 +49,12 @@ export default function App() {
 
   /* ── Derived state ── */
 
+  const latestVersion = apiAgents?.latest_version ?? null;
+
   const agents: Agent[] = useMemo(() => {
-    if (!apiAgents) return [] as Agent[];
-    return apiAgents.map(mapApiAgentToUi);
-  }, [apiAgents]);
+    if (!apiAgents?.agents) return [] as Agent[];
+    return apiAgents.agents.map(mapApiAgentToUi);
+  }, [apiAgents, latestVersion]);
 
   /* accumulate keystrokes into the feed */
   useEffect(() => {
@@ -100,6 +102,14 @@ export default function App() {
     setActiveView("detail");
   };
 
+  const handleDeleteAgent = async (id: string) => {
+    try {
+      await api.deleteAgent(id);
+      setSelectedAgentId(null);
+      setActiveView("feed");
+    } catch {}
+  };
+
   const activeCount = agents.filter((a) => a.status === "active").length;
   const idleCount = agents.filter((a) => a.status === "idle").length;
   const offlineCount = agents.filter((a) => a.status === "offline").length;
@@ -126,6 +136,7 @@ export default function App() {
           agents={agents}
           selectedAgentId={selectedAgentId}
           onSelectAgent={handleSelectAgent}
+          latestVersion={latestVersion}
         />
 
         <main className="flex-1 min-w-0 flex flex-col">
@@ -141,6 +152,8 @@ export default function App() {
               agent={selectedAgent}
               entries={allEntries}
               activityData={activityData24h}
+              onDelete={handleDeleteAgent}
+              latestVersion={latestVersion}
             />
           )}
         </main>

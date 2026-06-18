@@ -7,6 +7,7 @@ export interface Agent {
   hostname: string;
   ip: string;
   os: string;
+  version: string;
   keystrokeCount: number;
   status: AgentStatus;
   lastSeen: string;
@@ -32,12 +33,18 @@ export interface ApiAgent {
   hostname: string;
   ip: string;
   os: string;
+  version?: string;
   keystroke_count: number;
   status: AgentStatus;
   last_seen_utc: string;
   first_seen_utc?: string;
   username?: string;
   activity_history: number[];
+}
+
+export interface ApiAgentsResponse {
+  agents: ApiAgent[];
+  latest_version: string | null;
 }
 
 export interface ApiKeystroke {

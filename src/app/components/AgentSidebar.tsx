@@ -6,6 +6,26 @@ interface AgentSidebarProps {
   agents: Agent[];
   selectedAgentId: string | null;
   onSelectAgent: (id: string) => void;
+  latestVersion: string | null;
+}
+
+function VersionBadge({ version, latestVersion }: { version: string; latestVersion: string | null }) {
+  const isLatest = latestVersion && version === latestVersion;
+  const color = isLatest ? "#3fb950" : latestVersion ? "#d29922" : "#30363d";
+  return (
+    <span
+      className="px-1 py-0.5 rounded"
+      style={{
+        backgroundColor: `${color}1a`,
+        color,
+        fontFamily: "JetBrains Mono, monospace",
+        fontSize: 8,
+        fontWeight: 600,
+      }}
+    >
+      v{version}
+    </span>
+  );
 }
 
 const STATUS_COLOR: Record<AgentStatus, string> = {
@@ -39,7 +59,7 @@ function MiniSparkbar({ data }: { data: number[] }) {
   );
 }
 
-export function AgentSidebar({ agents, selectedAgentId, onSelectAgent }: AgentSidebarProps) {
+export function AgentSidebar({ agents, selectedAgentId, onSelectAgent, latestVersion }: AgentSidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
 
   return (
@@ -144,15 +164,18 @@ export function AgentSidebar({ agents, selectedAgentId, onSelectAgent }: AgentSi
 
                 {/* Bottom row */}
                 <div className="flex items-center justify-between">
-                  <span
-                    style={{
-                      color: "#58a6ff",
-                      fontFamily: "JetBrains Mono, monospace",
-                      fontSize: 10,
-                    }}
-                  >
-                    {agent.keystrokeCount.toLocaleString()} keys
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span
+                      style={{
+                        color: "#58a6ff",
+                        fontFamily: "JetBrains Mono, monospace",
+                        fontSize: 10,
+                      }}
+                    >
+                      {agent.keystrokeCount.toLocaleString()} keys
+                    </span>
+                    <VersionBadge version={agent.version} latestVersion={latestVersion} />
+                  </div>
                   <MiniSparkbar data={agent.activityHistory} />
                 </div>
               </div>

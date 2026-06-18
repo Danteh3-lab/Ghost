@@ -1,4 +1,4 @@
-import type { ApiAgent, ApiKeystroke, AgentConfig, HourlyActivity } from "../types";
+import type { ApiAgent, ApiAgentsResponse, ApiKeystroke, AgentConfig, HourlyActivity } from "../types";
 
 const ENV_BASE = import.meta.env.VITE_API_BASE_URL;
 const API_BASE = ENV_BASE ?? "";
@@ -16,7 +16,7 @@ export const api = {
   /* ── Agents ── */
 
   listAgents: () =>
-    fetchJson<ApiAgent[]>("/api/agents"),
+    fetchJson<ApiAgentsResponse>("/api/agents"),
 
   getAgent: (id: string) =>
     fetchJson<ApiAgent>(`/api/agents/${id}`),
@@ -31,6 +31,11 @@ export const api = {
     fetchJson<{ status: string }>(`/api/agents/${id}/action`, {
       method: "POST",
       body: JSON.stringify({ action }),
+    }),
+
+  deleteAgent: (id: string) =>
+    fetchJson<{ status: string }>(`/api/agents/${id}`, {
+      method: "DELETE",
     }),
 
   /* ── Keystrokes ── */
@@ -95,6 +100,7 @@ export function mapApiAgentToUi(api: ApiAgent) {
     hostname: api.hostname,
     ip: api.ip,
     os: api.os,
+    version: api.version || "0.0.0",
     keystrokeCount: api.keystroke_count,
     status,
     lastSeen: lastSeenDisplay,
