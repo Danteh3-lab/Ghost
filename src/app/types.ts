@@ -14,6 +14,11 @@ export interface Agent {
   activityHistory: number[];
   username?: string;
   firstSeen?: string;
+  country?: string;
+  countryCode?: string;
+  city?: string;
+  latitude?: number;
+  longitude?: number;
 }
 
 export interface KeystrokeEntry {
@@ -40,6 +45,11 @@ export interface ApiAgent {
   first_seen_utc?: string;
   username?: string;
   activity_history: number[];
+  country?: string;
+  country_code?: string;
+  city?: string;
+  latitude?: number;
+  longitude?: number;
 }
 
 export interface ApiAgentsResponse {

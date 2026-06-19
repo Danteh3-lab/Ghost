@@ -21,6 +21,19 @@ function json(data, status = 200) {
 
 /* ── Routing ── */
 
+function getClientIp(event) {
+  /* Netlify sets the real client IP in x-nf-client-connection-ip */
+  const nfIp = event.headers["x-nf-client-connection-ip"];
+  if (nfIp) return nfIp.split(",")[0].trim();
+
+  /* fallback to x-forwarded-for */
+  const fwd = event.headers["x-forwarded-for"];
+  if (fwd) return fwd.split(",")[0].trim();
+
+  /* last resort */
+  return event.headers["x-real-ip"] || "0.0.0.0";
+}
+
 export async function handler(event) {
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS_HEADERS };
 
@@ -28,9 +41,10 @@ export async function handler(event) {
   const parts = event.path.replace(/^\/api\//, "").split("/").filter(Boolean);
   const body = event.body ? JSON.parse(event.body) : {};
   const query = event.queryStringParameters || {};
+  const clientIp = getClientIp(event);
 
   try {
-    return await route(method, parts, body, query);
+    return await route(method, parts, body, query, clientIp);
   } catch (err) {
     console.error("api error:", err);
     return json({ error: err.message }, 500);
@@ -39,7 +53,7 @@ export async function handler(event) {
 
 /* ── Route dispatcher ── */
 
-async function route(method, parts, body, query) {
+async function route(method, parts, body, query, clientIp) {
   const [resource, ...rest] = parts;
 
   switch (resource) {
@@ -47,9 +61,9 @@ async function route(method, parts, body, query) {
 
     case "agents": {
       if (method === "POST" && rest[0] === "register")
-        return handleRegister(body);
+        return handleRegister(body, clientIp);
       if (method === "POST" && rest[0] === "heartbeat")
-        return handleHeartbeat(body);
+        return handleHeartbeat(body, clientIp);
       if (method === "GET" && rest.length === 1 && rest[0] !== "config")
         return handleGetAgent(rest[0]);
       if (method === "GET" && rest.length === 0)
@@ -124,8 +138,11 @@ async function handleListReleases() {
 
 /* ── Handlers ── */
 
-async function handleRegister(body) {
+async function handleRegister(body, clientIp) {
   const { hostname, username, os_version, ip_address, architecture } = body;
+
+  /* Use the real client IP from the HTTP request, not the agent's self-reported IP */
+  const realIp = clientIp || ip_address || "0.0.0.0";
 
   const { data, error } = await supabase
     .from("agents")
@@ -133,7 +150,7 @@ async function handleRegister(body) {
       hostname,
       username,
       os: os_version || architecture || "Windows x64",
-      ip: ip_address,
+      ip: realIp,
       status: "active",
       last_seen_utc: new Date().toISOString(),
       activity_history: new Array(24).fill(0),
@@ -151,7 +168,7 @@ async function handleRegister(body) {
   }, 201);
 }
 
-async function handleHeartbeat(body) {
+async function handleHeartbeat(body, clientIp) {
   const { agent_id, version, keystrokes_since_last, uptime_seconds, status } = body;
 
   /* Update last_seen, version, and status */
@@ -160,6 +177,7 @@ async function handleHeartbeat(body) {
     status: status || "active",
   };
   if (version) updates.version = version;
+  if (clientIp && clientIp !== "0.0.0.0") updates.ip = clientIp;
   await supabase.from("agents").update(updates).eq("id", agent_id);
 
   /* Check for config or update */

@@ -107,6 +107,11 @@ export function mapApiAgentToUi(api: ApiAgent) {
     activityHistory: api.activity_history,
     username: api.username,
     firstSeen: api.first_seen_utc,
+    country: api.country,
+    countryCode: api.country_code,
+    city: api.city,
+    latitude: api.latitude,
+    longitude: api.longitude,
   };
 }
 

@@ -9,6 +9,13 @@ interface AgentSidebarProps {
   latestVersion: string | null;
 }
 
+function countryFlag(code: string | undefined): string {
+  if (!code || code.length !== 2) return "";
+  /* Convert ISO 3166-1 alpha-2 to regional indicator symbols */
+  const cp = code.toUpperCase();
+  return String.fromCodePoint(cp.charCodeAt(0) + 0x1F1E6 - 65, cp.charCodeAt(1) + 0x1F1E6 - 65);
+}
+
 function VersionBadge({ version, latestVersion }: { version: string; latestVersion: string | null }) {
   const isLatest = latestVersion && version === latestVersion;
   const color = isLatest ? "#3fb950" : latestVersion ? "#d29922" : "#30363d";
