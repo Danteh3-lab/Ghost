@@ -1,4 +1,4 @@
-import type { ApiAgent, ApiAgentsResponse, ApiKeystroke, AgentConfig, HourlyActivity } from "../types";
+import type { ApiAgent, ApiAgentsResponse, ApiKeystroke, ApiCommandResult, CommandResult, AgentConfig, HourlyActivity } from "../types";
 
 const ENV_BASE = import.meta.env.VITE_API_BASE_URL;
 const API_BASE = ENV_BASE ?? "";
@@ -27,10 +27,10 @@ export const api = {
       body: JSON.stringify(config),
     }),
 
-  sendAgentAction: (id: string, action: string) =>
+  sendAgentAction: (id: string, action: string, payload?: Record<string, unknown>) =>
     fetchJson<{ status: string }>(`/api/agents/${id}/action`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, payload }),
     }),
 
   deleteAgent: (id: string) =>
@@ -68,6 +68,12 @@ export const api = {
 
   getAgentConfig: (agentId: string) =>
     fetchJson<AgentConfig>(`/api/agents/${agentId}/config`),
+
+  getAgentCommands: (agentId: string, limit?: number) => {
+    const qp = new URLSearchParams();
+    if (limit !== undefined) qp.set("limit", String(limit));
+    return fetchJson<ApiCommandResult[]>(`/api/agents/${agentId}/commands?${qp.toString()}`);
+  },
 };
 
 /* ── Transform helpers (snake_case API → camelCase UI) ── */
@@ -167,4 +173,16 @@ export function bufferKeystrokes(apiEntries: ApiKeystroke[], gapMs = 500): Buffe
   }
 
   return grouped;
+}
+
+export function mapApiCommandResultToUi(api: ApiCommandResult): CommandResult {
+  return {
+    id: api.id,
+    agentId: api.agent_id,
+    command: api.command,
+    exitCode: api.exit_code,
+    stdout: api.stdout,
+    stderr: api.stderr,
+    executedAt: api.executed_at,
+  };
 }

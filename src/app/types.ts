@@ -78,3 +78,26 @@ export interface AgentConfig {
   blacklist: string[];
   enabled: boolean;
 }
+
+/* ── Command Execution ── */
+
+export interface ApiCommandResult {
+  id: string;
+  agent_id: string;
+  action_id: string;
+  command: string;
+  exit_code: number;
+  stdout: string;
+  stderr: string;
+  executed_at: string;
+}
+
+export interface CommandResult {
+  id: string;
+  agentId: string;
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  executedAt: string;
+}

